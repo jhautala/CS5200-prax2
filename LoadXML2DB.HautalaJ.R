@@ -2,6 +2,10 @@
 # clean the environment
 rm(list=ls())
 
+# config/options
+do_ingest_xml <- FALSE
+do_save_csvs <- TRUE
+
 # simple logging
 logf <- function(s, ...) {
   print(Sys.time())
@@ -27,9 +31,9 @@ for (dep in deps) {
 }
 
 # establish constants
-dbName <- 'pubmed.db'
 xmlFile <- 'pubmed.xml'
 dtdFile <- 'pubmed.dtd'
+dbFile <- 'pubmed.db'
 
 # download the XML and DTD
 xmlUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/pubmed.xml'
@@ -296,225 +300,222 @@ AuthorXmlDto <- function(author_node) {
 }
 
 # --- Ingestion loop
-# NOTE: we use environments for faster lookup of authors and journals
-authors <- new.env()
-journals <- new.env()
-articles <- list()
-article_authors <- list()
-article_id <- 0
-logf('Starting ingestion')
-for (article_node in xpathSApply(xmlObj, '//Article')) {
-  article_id <- article_id + 1
-  pmid <- xmlGetAttr(article_node, 'PMID')
-  if (is.null(pmid)) {
-    message(sprintf('Missing "PMID" for article element %s', article_id))
-    next
-  }
-  
-  # initialize primary keys
-  journal_id <- NA
-  
-  details_node <- extract_node(
-    article_node,
-    'PubDetails',
-    sprintf('"PubDetails" for PMID="%s"', pmid)
-  )
-  if (is.null(details_node)) {
-    next
-  }
-  
-  # extract child values
-  article_title <- extract_value(details_node, 'ArticleTitle')
-  
-  # extract Journal metadata
-  journal_node <- extract_node(
-    details_node,
-    'Journal',
-    sprintf('"Journal" for article with PMID="%s"', pmid)
-  )
-  journal_xml_dto <- JournalXmlDto(journal_node)
-  if (is.null(journal_xml_dto@issn)) {
-    # establish a null reference for journal
+if (do_ingest_xml) {
+  # NOTE: we use environments for faster lookup of authors and journals
+  authors <- new.env()
+  journals <- new.env()
+  articles <- list()
+  article_authors <- list()
+  article_id <- 0
+  logf('Starting ingestion')
+  for (article_node in xpathSApply(xmlObj, '//Article')) {
+    article_id <- article_id + 1
+    pmid <- xmlGetAttr(article_node, 'PMID')
+    if (is.null(pmid)) {
+      message(sprintf('Missing "PMID" for article element %s', article_id))
+      next
+    }
+    
+    # initialize primary keys
     journal_id <- NA
-  } else {
-    # register with our journal vector
-    if (exists(journal_xml_dto@issn, where=journals)) {
-      # TODO: check for mismatched metadata?
+    
+    details_node <- extract_node(
+      article_node,
+      'PubDetails',
+      sprintf('"PubDetails" for PMID="%s"', pmid)
+    )
+    if (is.null(details_node)) {
+      next
+    }
+    
+    # extract child values
+    article_title <- extract_value(details_node, 'ArticleTitle')
+    
+    # extract Journal metadata
+    journal_node <- extract_node(
+      details_node,
+      'Journal',
+      sprintf('"Journal" for article with PMID="%s"', pmid)
+    )
+    journal_xml_dto <- JournalXmlDto(journal_node)
+    if (is.null(journal_xml_dto@issn)) {
+      # establish a null reference for journal
+      journal_id <- NA
     } else {
-      # NOTE: we use a simple vector to represent JournalDbDto
-      journals[[journal_xml_dto@issn]] = c(
-        issn_type=journal_xml_dto@issn_type,
-        title=journal_xml_dto@title,
-        iso_abbrev=journal_xml_dto@iso_abbrev
-      )
-    }
-    
-    # extract journal ID for joining
-    # TODO: just use length(journals) for new journal case? probably premature optimization...
-    journal_id <- which(names(journals) == journal_xml_dto@issn)
-  }
-  
-  # extract author list
-  author_list_node <- extract_node(
-    details_node,
-    'AuthorList',
-    sprintf('"AuthorList" for article with PMID="%s"', pmid)
-  )
-  
-  author_list_complete <- NA
-  if (!is.null(author_list_node)) {
-    author_list_complete_YN <- xmlGetAttr(author_list_node, 'CompleteYN')
-    if (!is.null(author_list_complete_YN)) {
-      author_list_complete <- 'Y' == author_list_complete_YN
-    }
-    
-    author_nodes <- xmlChildren(author_list_node)
-    for (author_node in author_nodes) {
-      author_xml_dto <- AuthorXmlDto(author_node)
-      author_uid <- xml_dto_id(author_xml_dto)
-      if (!exists(author_uid, where=authors)) {
-        # NOTE: we reuse the XML DTO as DB DTO
-        authors[[author_uid]] = author_xml_dto
+      # register with our journal vector
+      if (exists(journal_xml_dto@issn, where=journals)) {
+        # TODO: check for mismatched metadata?
+      } else {
+        # NOTE: we use a simple vector to represent JournalDbDto
+        journals[[journal_xml_dto@issn]] = c(
+          issn_type=journal_xml_dto@issn_type,
+          title=journal_xml_dto@title,
+          iso_abbrev=journal_xml_dto@iso_abbrev
+        )
       }
-      author_id <- which(names(authors) == author_uid)
-      article_authors <- append(
-        article_authors,
-        list(c(
-          pmid=pmid,
-          author_id=author_id,
-          is_valid=author_xml_dto@is_valid
-        ))
-      )
+      
+      # extract journal ID for joining
+      # TODO: just use length(journals) for new journal case? probably premature optimization...
+      journal_id <- which(names(journals) == journal_xml_dto@issn)
     }
+    
+    # extract author list
+    author_list_node <- extract_node(
+      details_node,
+      'AuthorList',
+      sprintf('"AuthorList" for article with PMID="%s"', pmid)
+    )
+    
+    author_list_complete <- NA
+    if (!is.null(author_list_node)) {
+      author_list_complete_YN <- xmlGetAttr(author_list_node, 'CompleteYN')
+      if (!is.null(author_list_complete_YN)) {
+        author_list_complete <- 'Y' == author_list_complete_YN
+      }
+      
+      author_nodes <- xmlChildren(author_list_node)
+      for (author_node in author_nodes) {
+        author_xml_dto <- AuthorXmlDto(author_node)
+        author_uid <- xml_dto_id(author_xml_dto)
+        if (!exists(author_uid, where=authors)) {
+          # NOTE: we reuse the XML DTO as DB DTO
+          authors[[author_uid]] = author_xml_dto
+        }
+        author_id <- which(names(authors) == author_uid)
+        article_authors <- append(
+          article_authors,
+          list(c(
+            pmid=pmid,
+            author_id=author_id,
+            is_valid=author_xml_dto@is_valid
+          ))
+        )
+      }
+    }
+    
+    articles[[pmid]] = c(
+      journal_id=journal_id,
+      article_title=article_title,
+      cited_medium=journal_xml_dto@cited_medium,
+      journal_volume=journal_xml_dto@volume,
+      journal_issue=journal_xml_dto@issue,
+      pub_year=journal_xml_dto@pub_year,
+      pub_month=journal_xml_dto@pub_month,
+      pub_day=journal_xml_dto@pub_day,
+      pub_season=journal_xml_dto@pub_season,
+      medline_date=journal_xml_dto@medline_date,
+      author_list_complete=author_list_complete
+    )
   }
+  logf('Finished ingestion')
   
-  articles[[pmid]] = c(
-    journal_id=journal_id,
-    article_title=article_title,
-    cited_medium=journal_xml_dto@cited_medium,
-    journal_volume=journal_xml_dto@volume,
-    journal_issue=journal_xml_dto@issue,
-    pub_year=journal_xml_dto@pub_year,
-    pub_month=journal_xml_dto@pub_month,
-    pub_day=journal_xml_dto@pub_day,
-    pub_season=journal_xml_dto@pub_season,
-    medline_date=journal_xml_dto@medline_date,
-    author_list_complete=author_list_complete
+  # --- Conversion to data frames
+  # create author dataframe
+  authors <- as.list(authors)
+  author_cols <- c(
+    "author_id",
+    "last_name",
+    "first_name",
+    "initials",
+    "suffix",
+    "collective_name",
+    "affiliation"
   )
+  author_mat <- matrix(
+    NA,
+    nrow=length(authors),
+    ncol=length(author_cols),
+    dimnames=list(NULL, author_cols)
+  )
+  for (i in seq_along(authors)) {
+    author <- authors[[i]]
+    author_mat[i, 'author_id'] <- i
+    author_mat[i, 'last_name'] <- author@last_name
+    author_mat[i, 'first_name'] <- author@first_name
+    author_mat[i, 'initials'] <- author@initials
+    author_mat[i, 'suffix'] <- author@suffix
+    author_mat[i, 'collective_name'] <- author@collective_name
+    author_mat[i, 'affiliation'] <- author@affiliation
+  }
+  author_df <- data.frame(author_mat, stringsAsFactors=FALSE)
+  logf('Created author data frame (nrow=%s; ncol=%s)', nrow(author_df), ncol(author_df))
+  
+  # create journal dataframe
+  journals <- as.list(journals)
+  journal_df <- do.call(rbind, lapply(journals, function(j) {
+    data.frame(
+      issn_type=j['issn_type'],
+      title=j['title'],
+      iso_abbrev=j['iso_abbrev'],
+      stringsAsFactors=FALSE
+    )
+  }))
+  journal_df$issn <- row.names(journal_df)
+  row.names(journal_df) <- NULL # reset the index
+  journal_df$journal_id <- seq(nrow(journal_df)) # establish journal IDs
+  journal_df <- journal_df[,c('journal_id', 'issn', 'issn_type', 'title', 'iso_abbrev')]
+  logf('Created journal data frame (nrow=%s; ncol=%s)', nrow(journal_df), ncol(journal_df))
+  
+  # create article dataframe
+  article_df <- do.call(rbind, lapply(articles, function(a) {
+    data.frame(
+      journal_id=a['journal_id'],
+      article_title=a['article_title'],
+      cited_medium=a['cited_medium'],
+      journal_volume=a['journal_volume'],
+      journal_issue=a['journal_issue'],
+      pub_year=a['pub_year'],
+      pub_month=a['pub_month'],
+      pub_day=a['pub_day'],
+      pub_season=a['pub_season'],
+      medline_date=a['medline_date'],
+      author_list_complete=a['author_list_complete'],
+      stringsAsFactors=FALSE,
+      row.names=NULL
+    )
+  }))
+  article_df$pmid <- row.names(article_df)
+  row.names(article_df) <- NULL
+  cols <- colnames(article_df)
+  article_df <- article_df[, c(cols[length(cols)], cols[1:length(cols)-1])]
+  logf('Created article data frame (nrow=%s; ncol=%s)', nrow(article_df), ncol(article_df))
+  
+  # create join table for authors to articles
+  article_author_df <- do.call(rbind, lapply(article_authors, function(aa) {
+    data.frame(
+      pmid=aa['pmid'],
+      author_id=aa['author_id'],
+      is_valid=aa['is_valid'],
+      stringsAsFactors=FALSE,
+      row.names=NULL
+    )
+  }))
+  logf(
+    'Created article_author data frame (nrow=%s; ncol=%s)',
+    nrow(article_author_df),
+    ncol(article_author_df)
+  )
+  
+  # --- Save output
+  if (do_save_csvs) {
+    # save results of ingestion to working directory
+    # NOTE: if we want to make these files 'canonical', copy them to the data directory
+    write.csv(journal_df, 'journal_df.csv')
+    write.csv(author_df, 'author_df.csv')
+    write.csv(article_df, 'article_df.csv')
+    write.csv(article_author_df, 'article_author_df.csv')
+    logf('Finished writing to CSV')
+  } else {
+    log('Skipped saving CSVs')
+  }
+} else {
+  # load extant 'canonical' CSVs from data directory
+  journal_df <- read.csv('data/journal_df.csv')
+  author_df <- read.csv('data/author_df.csv')
+  article_df <- read.csv('data/article_df.csv')
+  article_author_df <- read.csv('data/article_author_df.csv')
+  logf('Loaded extant CSVs')
 }
-logf('Finished ingestion')
 
-# --- Conversion to data frames
-# create author dataframe
-authors <- as.list(authors)
-author_cols <- c(
-  "author_id",
-  "last_name",
-  "first_name",
-  "initials",
-  "suffix",
-  "collective_name",
-  "affiliation"
-)
-author_mat <- matrix(
-  NA,
-  nrow=length(authors),
-  ncol=length(author_cols),
-  dimnames=list(NULL, author_cols)
-)
-for (i in seq_along(authors)) {
-  author <- authors[[i]]
-  author_mat[i, 'author_id'] <- i
-  author_mat[i, 'last_name'] <- author@last_name
-  author_mat[i, 'first_name'] <- author@first_name
-  author_mat[i, 'initials'] <- author@initials
-  author_mat[i, 'suffix'] <- author@suffix
-  author_mat[i, 'collective_name'] <- author@collective_name
-  author_mat[i, 'affiliation'] <- author@affiliation
-}
-author_df <- data.frame(author_mat, stringsAsFactors=FALSE)
-logf('Created author data frame (nrow=%s; ncol=%s)', nrow(author_df), ncol(author_df))
+# --- Create schema
 
-# create journal dataframe
-journals <- as.list(journals)
-journal_df <- do.call(rbind, lapply(journals, function(j) {
-  data.frame(
-    issn_type=j['issn_type'],
-    title=j['title'],
-    iso_abbrev=j['iso_abbrev'],
-    stringsAsFactors=FALSE
-  )
-}))
-journal_df$issn <- row.names(journal_df)
-row.names(journal_df) <- NULL # reset the index
-journal_df$journal_id <- seq(nrow(journal_df)) # establish journal IDs
-journal_df <- journal_df[,c('journal_id', 'issn', 'issn_type', 'title', 'iso_abbrev')]
-logf('Created journal data frame (nrow=%s; ncol=%s)', nrow(journal_df), ncol(journal_df))
-
-# create article dataframe
-article_df <- do.call(rbind, lapply(articles, function(a) {
-  data.frame(
-    journal_id=a['journal_id'],
-    article_title=a['article_title'],
-    cited_medium=a['cited_medium'],
-    journal_volume=a['journal_volume'],
-    journal_issue=a['journal_issue'],
-    pub_year=a['pub_year'],
-    pub_month=a['pub_month'],
-    pub_day=a['pub_day'],
-    pub_season=a['pub_season'],
-    medline_date=a['medline_date'],
-    author_list_complete=a['author_list_complete'],
-    stringsAsFactors=FALSE,
-    row.names=NULL
-  )
-}))
-article_df$pmid <- row.names(article_df)
-row.names(article_df) <- NULL
-cols <- colnames(article_df)
-article_df <- article_df[, c(cols[length(cols)], cols[1:length(cols)-1])]
-logf('Created article data frame (nrow=%s; ncol=%s)', nrow(article_df), ncol(article_df))
-
-# create join table for authors to articles
-article_author_df <- do.call(rbind, lapply(article_authors, function(aa) {
-  data.frame(
-    pmid=aa['pmid'],
-    author_id=aa['author_id'],
-    is_valid=aa['is_valid'],
-    stringsAsFactors=FALSE,
-    row.names=NULL
-  )
-}))
-logf(
-  'Created article_author data frame (nrow=%s; ncol=%s)',
-  nrow(article_author_df),
-  ncol(article_author_df)
-)
-
-# --- Save output
-# save results of ingestion
-# write.csv(journal_df, 'journal_df.csv')
-# write.csv(author_df, 'author_df.csv')
-# write.csv(article_df, 'article_df.csv')
-# write.csv(article_author_df, 'article_author_df.csv')
-logf('Finished not writing to CSV')
-
-# journal_df <- read.csv('data/draft1/journal_df.csv')
-# author_df <- read.csv('data/draft1/author_df.csv')
-# article_df <- read.csv('data/draft1/article_df.csv')
-# article_author_df <- read.csv('data/draft1/article_author_df.csv')
-# 
-# dff <- list(
-#   journal_df=journal_df,
-#   article_author_df=article_author_df,
-#   article_df=article_df,
-#   author_df=author_df
-# )
-# for (df_name in names(dff)) {
-#   print(df_name)
-#   df <- dff[[df_name]]
-#   for (col in colnames(df)) {
-#     na_count <- sum(is.na(df[[col]]))
-#     print(sprintf('  %s: %s', col, na_count))
-#   }
-# }
