@@ -3,7 +3,7 @@
 rm(list=ls())
 
 # install dependencies
-deps <- c('xml2', 'RSQLite', 'httr', 'purrr', 'parallel')
+deps <- c('xml2', 'RSQLite', 'httr', 'parallel', 'sets')
 missingDeps <- setdiff(deps, installed.packages()[,'Package'])
 if (length(missingDeps)) {
   install.packages(missingDeps)
@@ -12,8 +12,8 @@ if (length(missingDeps)) {
 library(xml2)
 library(RSQLite)
 library(httr)
-library(purrr)
 library(parallel)
+library(sets)
 
 # confirm dependencies
 print(sprintf('R: %s', R.version.string))
@@ -87,8 +87,8 @@ setClass(
     cited_medium='character',
     title='character',
     iso_abbrev='character',
-    volume='integer',
-    issue='integer',
+    volume='character',
+    issue='character',
     pub_year='integer',
     pub_month='integer',
     pub_day='integer',
@@ -126,8 +126,8 @@ JournalXmlDto <- function(journal_node) {
   cited_medium <- NA_character_
   title <- NA_character_
   iso_abbrev <- NA_character_
-  volume <- NA_integer_
-  issue <- NA_integer_
+  volume <- NA_character_
+  issue <- NA_character_
   pub_year <- NA_integer_
   pub_month <- NA_integer_
   pub_day <- NA_integer_
@@ -149,8 +149,8 @@ JournalXmlDto <- function(journal_node) {
   journal_issue_node <- xml_find_first(journal_node, 'JournalIssue')
   if (!is.na(journal_issue_node)) {
     cited_medium <- xml_attr(journal_issue_node, 'CitedMedium')
-    volume <- extract_integer(journal_issue_node, 'Volume')
-    issue <- extract_integer(journal_issue_node, 'Issue')
+    volume <- extract_string(journal_issue_node, 'Volume')
+    issue <- extract_string(journal_issue_node, 'Issue')
     
     # extract PubDate (Year, Month, Day, Season, MedlineDate)
     pubdate_node <- xml_find_first(journal_issue_node, 'PubDate')
@@ -272,107 +272,7 @@ AuthorXmlDto <- function(author_node) {
   return(author)
 }
 
-a1 <- xml_find_first(doc, '/Publications/Article/PubDetails/ArticleTitle')
-a1 <- xml_attr(doc, '/Publications/Article@PMID')
-a1 <- xml_find_first(doc, '/Publications/Article[@PMID="0"]')
-is.na(a1)
-xml_text(a1)
-xml_attr(a1, 'PMID')
-
-
-
-# --- loop-based approach
-authors <- list()
-journals <- list()
-articles <- list()
-article_authors <- list()
-
-pmids <- xml_find_all(doc, "/Publications/Article") %>% map(function(x) xml_attr(x, 'PMID'))
-for (pmid in pmids) {
-  details_node <- xml_find_first(
-    doc,
-    sprintf('/Publications/Article[@PMID="%s"]/PubDetails', pmid)
-  )
-  if (is.na(details_node)) {
-    message(sprintf('Missing "PubDetails" for PMID="%s"', pmid))
-    next
-  }
-  
-  # extract Journal metadata
-  journal_node <- xml_find_first(details_node, 'Journal')
-  if (is.na(journal_node)) {
-    # NOTE: we require that articles are 'in journals'
-    message(sprintf('Missing "Journal" for PMID="%s"', pmid))
-    next
-  }
-  
-  journal_xml_dto <- JournalXmlDto(journal_node)
-  
-  # register with our journal vector as needed
-  if (exists(journal_xml_dto@issn, where=journals)) {
-    # TODO: check for mismatched metadata?
-  } else {
-    # NOTE: we use a simple vector to represent JournalDbDto
-    journals[[journal_xml_dto@issn]] = c(
-      issn_type=journal_xml_dto@issn_type,
-      title=journal_xml_dto@title,
-      iso_abbrev=journal_xml_dto@iso_abbrev
-    )
-  }
-  
-  # extract journal ID for joining
-  # TODO: just use length(journals) for new journal case? probably premature optimization...
-  journal_id <- which(names(journals) == journal_xml_dto@issn)
-  
-  # extract author list
-  author_list_node <- xml_find_first(details_node, 'AuthorList')
-  if (is.na(author_list_node)) {
-    author_list_complete <- NA
-    message(sprintf('Missing "AuthorList" for PMID="%s"', pmid))
-  } else {
-    author_list_complete_YN <- xml_attr(author_list_node, 'CompleteYN')
-    if (!is.na(author_list_complete_YN)) {
-      author_list_complete <- 'Y' == author_list_complete_YN
-    }
-    
-    author_nodes <- xml_children(author_list_node)
-    for (author_node in author_nodes) {
-      author_xml_dto <- AuthorXmlDto(author_node)
-      author_uid <- xml_dto_id(author_xml_dto)
-      if (!exists(author_uid, where=authors)) {
-        # NOTE: we reuse the XML DTO as DB DTO
-        authors[[author_uid]] = author_xml_dto
-      }
-      author_id <- which(names(authors) == author_uid)
-      article_authors <- append(
-        article_authors,
-        list(c(
-          pmid=pmid,
-          author_id=author_id,
-          is_valid=author_xml_dto@is_valid
-        ))
-      )
-    }
-  }
-  
-  article_title <- extract_string(details_node, 'ArticleTitle')
-  articles[[pmid]] = c(
-    journal_id=journal_id,
-    article_title=article_title,
-    cited_medium=journal_xml_dto@cited_medium,
-    journal_volume=journal_xml_dto@volume,
-    journal_issue=journal_xml_dto@issue,
-    pub_year=journal_xml_dto@pub_year,
-    pub_month=journal_xml_dto@pub_month,
-    pub_day=journal_xml_dto@pub_day,
-    pub_season=journal_xml_dto@pub_season,
-    medline_date=journal_xml_dto@medline_date,
-    author_list_complete=author_list_complete
-  )
-}
-
-
-# --- simpler loop
+# --- simple loop
 authors <- list()
 journals <- list()
 articles <- list()
@@ -462,18 +362,6 @@ for (article_node in xml_children(xml_root(doc))) {
 }
 
 # --- parallel solution WIP
-num_cores <- detectCores()
-
-# determine matrix sizes
-xml_find_all(doc, "/Publications/Article")
-
-lock <- makeCluster(1)
-
-authors <- list()
-journals <- list()
-articles <- list()
-article_authors <- list()
-
 process_article <- function(article_node) {
   pmid <- xml_attr(article_node, 'PMID')
   
@@ -493,19 +381,8 @@ process_article <- function(article_node) {
   
   journal_xml_dto <- JournalXmlDto(journal_node)
   
-  # register with our journal vector as needed
-  if (exists(journal_xml_dto@issn, where=journals)) {
-    # TODO: check for mismatched metadata?
-  } else {
-    # NOTE: we use a simple vector to represent JournalDbDto
-    journals[[journal_xml_dto@issn]] <<- c(
-      issn_type=journal_xml_dto@issn_type,
-      title=journal_xml_dto@title,
-      iso_abbrev=journal_xml_dto@iso_abbrev
-    )
-  }
-  
   # extract author list
+  authors <- list()
   author_list_node <- xml_find_first(details_node, 'AuthorList')
   if (is.na(author_list_node)) {
     author_list_complete <- NA
@@ -519,49 +396,71 @@ process_article <- function(article_node) {
     author_nodes <- xml_children(author_list_node)
     for (author_node in author_nodes) {
       author_xml_dto <- AuthorXmlDto(author_node)
-      author_uid <- xml_dto_id(author_xml_dto)
-      if (!exists(author_uid, where=authors)) {
-        # NOTE: we reuse the XML DTO as DB DTO
-        authors[[author_uid]] <<- author_xml_dto
-      }
-      author_id <- which(names(authors) == author_uid)
-      article_authors <<- append(
-        article_authors,
-        list(c(
-          pmid=pmid,
-          author_id=author_id,
-          is_valid=author_xml_dto@is_valid
-        ))
-      )
+      author_id <- xml_dto_id(author_xml_dto)
+      authors[[author_id]] <- author_xml_dto
     }
   }
-  
-  # extract journal ID for joining
-  journal_id <- which(names(journals) == journal_xml_dto@issn)
   
   # extract children of PubDetails
   article_title <- extract_string(details_node, 'ArticleTitle')
   
   # convert to vector and save to our list of articles
-  articles[[pmid]] <<- c(
-    journal_id=journal_id,
-    article_title=article_title,
-    cited_medium=journal_xml_dto@cited_medium,
-    journal_volume=journal_xml_dto@volume,
-    journal_issue=journal_xml_dto@issue,
-    pub_year=journal_xml_dto@pub_year,
-    pub_month=journal_xml_dto@pub_month,
-    pub_day=journal_xml_dto@pub_day,
-    pub_season=journal_xml_dto@pub_season,
-    medline_date=journal_xml_dto@medline_date,
-    author_list_complete=author_list_complete
-  )
+  return(list(
+    article=c(
+      pmid=pmid,
+      issn=journal_xml_dto@issn,
+      issn_type=journal_xml_dto@issn_type,
+      title=journal_xml_dto@title,
+      iso_abbrev=journal_xml_dto@iso_abbrev,
+      cited_medium=journal_xml_dto@cited_medium,
+      journal_volume=journal_xml_dto@volume,
+      journal_issue=journal_xml_dto@issue,
+      pub_year=journal_xml_dto@pub_year,
+      pub_month=journal_xml_dto@pub_month,
+      pub_day=journal_xml_dto@pub_day,
+      pub_season=journal_xml_dto@pub_season,
+      medline_date=journal_xml_dto@medline_date,
+      article_title=article_title,
+      author_list_complete=author_list_complete
+    ),
+    authors=authors
+  ))
 }
-articles_list <- xml_find_all(doc, "/Publications/Article")
-processed_articles <- mclapply(articles_list, process_article, mc.cores=num_cores)
+
+# collect the results of parallel parsing
+article_nodes <- xml_children(xml_root(doc))
+num_workers <- detectCores() - 1
+result_list <- mclapply(
+  article_nodes,
+  process_article,
+  mc.cores=num_workers
+)
+
+
+# test_result <- process_article_node(article_nodes[[1]])
+# print(test_result)
+# 
+# # Run the process_article_node function on each article node in parallel
+# jobs <- lapply(article_nodes, function(article_node) {
+#   mcparallel(tryCatch(process_article_node(article_node), error = function(e) e))
+# })
+# 
+# # Collect the results from each job
+# result_list <- lapply(jobs, mccollect)
+# 
+# # Print the errors that occurred during parallel processing
+# for (i in seq_along(result_list)) {
+#   if (inherits(result_list[[i]], "error")) {
+#     cat("Error in article node", i, ":", result_list[[i]]$message, "\n")
+#   }
+# }
 
 
 
+
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
 
 # create author dataframe
 author_cols <- c(
@@ -653,7 +552,6 @@ article_author_df <- do.call(rbind, lapply(article_authors, function(aa) {
   )
 }))
 print(article_author_df)
-
 
 save(journal_df, file='journal_df.Rda')
 save(author_df, file='author_df.Rda')

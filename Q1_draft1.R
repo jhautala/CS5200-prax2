@@ -1,11 +1,33 @@
+# clean the environment
+rm(list=ls())
+
+# install dependencies
+deps <- c('XML', 'RSQLite', 'httr')
+missingDeps <- setdiff(deps, installed.packages()[,'Package'])
+if (length(missingDeps)) {
+  install.packages(missingDeps)
+}
+
 library(XML)
 library(RSQLite)
 library(httr)
 
-# establish constants and download the DTD
+# confirm dependencies
+print(sprintf('R: %s', R.version.string))
+for (dep in deps) {
+  print(sprintf('%s: %s', dep, packageVersion(dep)))
+}
+
+# establish constants
 dbName <- 'pubmed.db'
-xmlFile <- 'pubmed22n0001-tf.xml'
+xmlFile <- 'pubmed.xml'
 dtdFile <- 'pubmed.dtd'
+
+# download the XML and DTD
+xmlUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/pubmed.xml'
+httr::GET(url=xmlUrl, httr::write_disk(xmlFile))
+dtdUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/pubmed.dtd'
+httr::GET(url=dtdUrl, httr::write_disk(dtdFile))
 
 # read XML and open DB connection
 xmlObj <- xmlParse(xmlFile, validate=TRUE)
