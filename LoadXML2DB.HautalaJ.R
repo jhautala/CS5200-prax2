@@ -3,7 +3,7 @@
 rm(list=ls())
 
 # config/options
-do_ingest_xml <- FALSE
+do_ingest_xml <- TRUE
 do_save_csvs <- TRUE
 
 # simple logging
@@ -34,7 +34,34 @@ for (dep in deps) {
 xmlFile <- 'pubmed.xml'
 dtdFile <- 'pubmed.dtd'
 dbFile <- 'pubmed.db'
+schemaFile <- 'oltp_schema.sql'
 
+# --- Part 1.5: Realize the schema
+db_init <- function() {
+  # clear extant DB
+  unlink(dbFile)
+  
+  # create fresh DB
+  dbcon <- dbConnect(RSQLite::SQLite(), dbFile)
+  
+  # enable foreign keys
+  dbExecute(dbcon, 'PRAGMA foreign_keys = ON')
+  
+  # read the schema file
+  schema_sql <- readChar(schemaFile, file.info(schemaFile)$size)
+  sqls_statements <- strsplit(schema_sql, '\\s*;\\s*')[[1]]
+  
+  # execute the SQL
+  for (sql in sqls_statements) {
+    dbExecute(dbcon, paste0(sql, ';'))
+  }
+  
+  return(dbcon)
+}
+dbcon <- db_init()
+on.exit(dbDisconnect(dbcon))
+
+# --- Part 1.6: Load the XML, with validation
 # download the XML and DTD
 xmlUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/pubmed.xml'
 httr::GET(url=xmlUrl, httr::write_disk(xmlFile))
@@ -46,7 +73,8 @@ logf('Downloaded XML and DTD')
 xmlObj <- xmlParse(xmlFile, validate=TRUE)
 logf('Parsed XML with validation')
 
-# --- XML extraction utilities
+# --- Part 1.7: ETL XML to SQLite
+# XML extraction utilities
 extract_value <- function(node, xpath) {
   value <- xpathSApply(node, xpath, xmlValue)
   if (length(value) == 0) {
@@ -75,17 +103,6 @@ extract_integer <- function(node, xpath) {
   return(value)
 }
 
-# TODO: delete this?
-extract_date <- function(node, xpath) {
-  value <- extract_value(node, xpath)
-  if (is.na(value)) {
-    value <- NA
-  } else {
-    value <- as.Date(value)
-  }
-  return(value)
-}
-
 extract_node <- function(node, xpath, desc=NA) {
   nodes <- xpathSApply(node, xpath)
   if (length(nodes) == 0) {
@@ -108,6 +125,7 @@ extract_node <- function(node, xpath, desc=NA) {
   return(nodes[[1]])
 }
 
+# --- Define DTOs and DTO-specific utility functions
 # a generic function for getting a unique identifier string from an XML DTO model
 setGeneric(
   "xml_dto_id",
@@ -268,7 +286,10 @@ AuthorXmlDto <- function(author_node) {
   
   # extract attributes
   validYN <- xmlGetAttr(author_node, 'ValidYN')
-  if (!is.null(validYN)) {
+  if (is.null(validYN)) {
+    is_valid <- NA
+  } else {
+    # NOTE: here we depend on the member type 'logical' to produce [0, 1]
     is_valid <- 'Y' == validYN
   }
   
@@ -299,6 +320,97 @@ AuthorXmlDto <- function(author_node) {
   return(author)
 }
 
+# functions for converting lists to data frames
+# TODO: Work to make this more consistent and easier to maintain?
+#       It would be nice to have the parser map XML DTOs to DB DTOs, then maybe
+#       this conversion could be more dynamic and generalized. During initial
+#       development, perhaps some things were prematurely optimized (e.g.
+#       avoiding "extra" classes and instantiations).
+list_to_author_df <- function(authors) {
+  author_cols <- c(
+    "author_id",
+    "last_name",
+    "first_name",
+    "initials",
+    "suffix",
+    "collective_name",
+    "affiliation"
+  )
+  author_mat <- matrix(
+    NA,
+    nrow=length(authors),
+    ncol=length(author_cols),
+    dimnames=list(NULL, author_cols)
+  )
+  for (i in seq_along(authors)) {
+    author <- authors[[i]]
+    author_mat[i, 'author_id'] <- i
+    author_mat[i, 'last_name'] <- author@last_name
+    author_mat[i, 'first_name'] <- author@first_name
+    author_mat[i, 'initials'] <- author@initials
+    author_mat[i, 'suffix'] <- author@suffix
+    author_mat[i, 'collective_name'] <- author@collective_name
+    author_mat[i, 'affiliation'] <- author@affiliation
+  }
+  author_df <- data.frame(author_mat, stringsAsFactors=FALSE)
+  author_df$author_id <- as.integer(author_df$author_id)
+  return(author_df)
+}
+
+list_to_journal_df <- function(journals) {
+  journal_df <- do.call(rbind, lapply(journals, function(j) {
+    data.frame(
+      issn_type=j['issn_type'],
+      title=j['title'],
+      iso_abbrev=j['iso_abbrev'],
+      stringsAsFactors=FALSE
+    )
+  }))
+  journal_df$issn <- row.names(journal_df)
+  row.names(journal_df) <- NULL # reset the index
+  journal_df$journal_id <- seq(nrow(journal_df)) # establish journal IDs
+  journal_df <- journal_df[,c('journal_id', 'issn', 'issn_type', 'title', 'iso_abbrev')]
+  return(journal_df)
+}
+
+list_to_article_df <- function(articles) {
+  article_df <- do.call(rbind, lapply(articles, function(a) {
+    data.frame(
+      journal_id=a['journal_id'],
+      article_title=a['article_title'],
+      cited_medium=a['cited_medium'],
+      journal_volume=a['journal_volume'],
+      journal_issue=a['journal_issue'],
+      pub_year=a['pub_year'],
+      pub_month=a['pub_month'],
+      pub_day=a['pub_day'],
+      pub_season=a['pub_season'],
+      medline_date=a['medline_date'],
+      author_list_complete=a['author_list_complete'],
+      stringsAsFactors=FALSE,
+      row.names=NULL
+    )
+  }))
+  article_df$pmid <- row.names(article_df)
+  row.names(article_df) <- NULL
+  cols <- colnames(article_df)
+  article_df <- article_df[, c(cols[length(cols)], cols[1:length(cols)-1])]
+  return(article_df)
+}
+
+list_to_article_author_df <- function(article_authors) {
+  article_author_df <- do.call(rbind, lapply(article_authors, function(aa) {
+    data.frame(
+      pmid=aa['pmid'],
+      author_id=aa['author_id'],
+      is_valid=aa['is_valid'],
+      stringsAsFactors=FALSE,
+      row.names=NULL
+    )
+  }))
+  return(article_author_df)
+}
+
 # --- Ingestion loop
 if (do_ingest_xml) {
   # NOTE: we use environments for faster lookup of authors and journals
@@ -315,6 +427,7 @@ if (do_ingest_xml) {
       message(sprintf('Missing "PMID" for article element %s', article_id))
       next
     }
+    pmid <- as.integer(pmid)
     
     # initialize primary keys
     journal_id <- NA
@@ -340,7 +453,7 @@ if (do_ingest_xml) {
     journal_xml_dto <- JournalXmlDto(journal_node)
     if (is.null(journal_xml_dto@issn)) {
       # establish a null reference for journal
-      journal_id <- NA
+      journal_id <- NA_integer_
     } else {
       # register with our journal vector
       if (exists(journal_xml_dto@issn, where=journals)) {
@@ -370,7 +483,8 @@ if (do_ingest_xml) {
     if (!is.null(author_list_node)) {
       author_list_complete_YN <- xmlGetAttr(author_list_node, 'CompleteYN')
       if (!is.null(author_list_complete_YN)) {
-        author_list_complete <- 'Y' == author_list_complete_YN
+        # NOTE: here we accommodate SQLite data type
+        author_list_complete <- if ('Y' == author_list_complete_YN) 1 else 0
       }
       
       author_nodes <- xmlChildren(author_list_node)
@@ -410,86 +524,18 @@ if (do_ingest_xml) {
   logf('Finished ingestion')
   
   # --- Conversion to data frames
-  # create author dataframe
-  authors <- as.list(authors)
-  author_cols <- c(
-    "author_id",
-    "last_name",
-    "first_name",
-    "initials",
-    "suffix",
-    "collective_name",
-    "affiliation"
-  )
-  author_mat <- matrix(
-    NA,
-    nrow=length(authors),
-    ncol=length(author_cols),
-    dimnames=list(NULL, author_cols)
-  )
-  for (i in seq_along(authors)) {
-    author <- authors[[i]]
-    author_mat[i, 'author_id'] <- i
-    author_mat[i, 'last_name'] <- author@last_name
-    author_mat[i, 'first_name'] <- author@first_name
-    author_mat[i, 'initials'] <- author@initials
-    author_mat[i, 'suffix'] <- author@suffix
-    author_mat[i, 'collective_name'] <- author@collective_name
-    author_mat[i, 'affiliation'] <- author@affiliation
-  }
-  author_df <- data.frame(author_mat, stringsAsFactors=FALSE)
+  author_df <- list_to_author_df(as.list(authors))
   logf('Created author data frame (nrow=%s; ncol=%s)', nrow(author_df), ncol(author_df))
   
-  # create journal dataframe
-  journals <- as.list(journals)
-  journal_df <- do.call(rbind, lapply(journals, function(j) {
-    data.frame(
-      issn_type=j['issn_type'],
-      title=j['title'],
-      iso_abbrev=j['iso_abbrev'],
-      stringsAsFactors=FALSE
-    )
-  }))
-  journal_df$issn <- row.names(journal_df)
-  row.names(journal_df) <- NULL # reset the index
-  journal_df$journal_id <- seq(nrow(journal_df)) # establish journal IDs
-  journal_df <- journal_df[,c('journal_id', 'issn', 'issn_type', 'title', 'iso_abbrev')]
+  journal_df <- list_to_journal_df(as.list(journals))
   logf('Created journal data frame (nrow=%s; ncol=%s)', nrow(journal_df), ncol(journal_df))
   
   # create article dataframe
-  article_df <- do.call(rbind, lapply(articles, function(a) {
-    data.frame(
-      journal_id=a['journal_id'],
-      article_title=a['article_title'],
-      cited_medium=a['cited_medium'],
-      journal_volume=a['journal_volume'],
-      journal_issue=a['journal_issue'],
-      pub_year=a['pub_year'],
-      pub_month=a['pub_month'],
-      pub_day=a['pub_day'],
-      pub_season=a['pub_season'],
-      medline_date=a['medline_date'],
-      author_list_complete=a['author_list_complete'],
-      stringsAsFactors=FALSE,
-      row.names=NULL
-    )
-  }))
-  article_df$pmid <- row.names(article_df)
-  row.names(article_df) <- NULL
-  cols <- colnames(article_df)
-  article_df <- article_df[, c(cols[length(cols)], cols[1:length(cols)-1])]
+  article_df <- list_to_article_df(articles)
   logf('Created article data frame (nrow=%s; ncol=%s)', nrow(article_df), ncol(article_df))
   
   # create join table for authors to articles
-  article_author_df <- do.call(rbind, lapply(article_authors, function(aa) {
-    data.frame(
-      pmid=aa['pmid'],
-      author_id=aa['author_id'],
-      is_valid=aa['is_valid'],
-      stringsAsFactors=FALSE,
-      row.names=NULL
-    )
-  }))
+  article_author_df <- list_to_article_author_df(article_authors)
   logf(
     'Created article_author data frame (nrow=%s; ncol=%s)',
     nrow(article_author_df),
@@ -500,10 +546,10 @@ if (do_ingest_xml) {
   if (do_save_csvs) {
     # save results of ingestion to working directory
     # NOTE: if we want to make these files 'canonical', copy them to the data directory
-    write.csv(journal_df, 'journal_df.csv')
-    write.csv(author_df, 'author_df.csv')
-    write.csv(article_df, 'article_df.csv')
-    write.csv(article_author_df, 'article_author_df.csv')
+    write.csv(journal_df, 'journal_df.csv', row.names=FALSE)
+    write.csv(author_df, 'author_df.csv', row.names=FALSE)
+    write.csv(article_df, 'article_df.csv', row.names=FALSE)
+    write.csv(article_author_df, 'article_author_df.csv', row.names=FALSE)
     logf('Finished writing to CSV')
   } else {
     log('Skipped saving CSVs')
@@ -517,5 +563,79 @@ if (do_ingest_xml) {
   logf('Loaded extant CSVs')
 }
 
-# --- Create schema
+# --- Write data frames to SQLite
+# filter out journals missing 'issn'
+# NOTE: Since we do not assign journal IDs to journals missing 'ISSN' during ingestion,
+#       we do not have to worry about breaking any links by deleting them here.
+#       However, as a matter of good practice (i.e. defensive programming), we
+#       grab some info here to make sure not to attempt to persist any such articles.
+missing_issn_mask <- is.na(journal_df$issn)
+missing_issn_df <- journal_df[missing_issn_mask,]
 
+# Check to see if we can identify candidates for missing ISSN by title or iso_abbrev
+# TODO: Implement ISSN inference? It would be messy, and apparently not fruitful for the available data
+title_match_mask <- journal_df$title %in% missing_issn_df$title
+iso_abbrev_match_ask <- journal_df$iso_abbrev %in% missing_issn_df$iso_abbrev
+issn_inference_candidate_df <- journal_df[(!missing_issn_mask & (title_match_mask | iso_abbrev_match_ask)),]
+n_journals <- nrow(journal_df)
+journal_df <- journal_df[!missing_issn_mask,]
+logf(
+  "Sanitized %s journals -> %s valid journals; deleted %s journals (missing 'ISSN'); %s candidates for inference",
+  n_journals,
+  nrow(journal_df),
+  nrow(missing_issn_df),
+  nrow(issn_inference_candidate_df)
+)
+
+# cleanup any articles orphaned by journals missing 'ISSN', or otherwise unlinked
+n_articles <- nrow(article_df)
+article_df <- article_df[article_df$journal_id %in% journal_df$journal_id,]
+logf(
+  'Sanitized %s articles -> %s valid articles; deleted %s articles missing journal',
+  n_articles,
+  nrow(article_df),
+  n_articles - nrow(article_df)
+)
+
+# cleanup any orphaned or redundant article_author records
+n_article_authors <- nrow(article_author_df)
+redundant_mask <- duplicated(article_author_df[, c("pmid", "author_id")])
+missing_author_mask <- !(!is.na(article_author_df$author_id) & article_author_df$author_id %in% author_df$author_id)
+missing_article_mask <- !(!is.na(article_author_df$pmid) & article_author_df$pmid %in% article_df$pmid)
+valid_mask <- !redundant_mask & !missing_author_mask & !missing_article_mask
+article_author_df <- article_author_df[valid_mask,]
+logf(
+  paste0(
+    'Sanitized %s article authors -> %s valid article authors; ',
+    'deleted %s records:\n\t',
+    '%s redundant\n\t',
+    '%s missing authors\n\t',
+    '%s missing articles\n\t',
+    '%s missing both'
+  ),
+  n_article_authors,
+  nrow(article_author_df),
+  n_article_authors - nrow(article_author_df),
+  sum(redundant_mask),
+  sum(missing_author_mask),
+  sum(missing_article_mask),
+  sum(missing_author_mask & missing_article_mask)
+)
+
+# Execute inserts
+tbls <- list(
+  author=author_df,
+  journal=journal_df,
+  article=article_df,
+  article_author=article_author_df
+)
+# # cleanup extant tables
+# # NOTE: this is not needed during normal execution, but it is useful when debugging
+# for (tbl in rev(names(tbls))) {
+#   dbExecute(dbcon, sprintf('delete from %s WHERE 1=1;', tbl))
+# }
+for (tbl in names(tbls)) {
+  df <- tbls[[tbl]]
+  dbWriteTable(dbcon, tbl, df, append=TRUE)
+  logf("Populated '%s' table (%s rows)", tbl, nrow(df))
+}
