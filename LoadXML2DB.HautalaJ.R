@@ -5,6 +5,7 @@ rm(list=ls())
 # config/options
 do_ingest_xml <- TRUE
 do_save_csvs <- TRUE
+do_http_cache <- TRUE
 
 # simple logging
 logf <- function(s, ...) {
@@ -64,10 +65,25 @@ on.exit(dbDisconnect(dbcon))
 # --- Part 1.6: Load the XML, with validation
 # download the XML and DTD
 xmlUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/pubmed.xml'
-httr::GET(url=xmlUrl, httr::write_disk(xmlFile))
 dtdUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/pubmed.dtd'
-httr::GET(url=dtdUrl, httr::write_disk(dtdFile))
-logf('Downloaded XML and DTD')
+if (do_http_cache) {
+  if (file.exists(xmlFile)) {
+    logf('Using cached XML: %s', normalizePath(xmlFile))
+  } else {
+    httr::GET(url=xmlUrl, httr::write_disk(xmlFile))
+    logf('Downloaded XML')
+  }
+  if (file.exists(dtdFile)) {
+    logf('Using cached DTD: %s', normalizePath(dtdFile))
+  } else {
+    httr::GET(url=dtdUrl, httr::write_disk(dtdFile))
+    logf('Downloaded DTD')
+  }
+} else {
+  httr::GET(url=xmlUrl, httr::write_disk(xmlFile, overwrite=TRUE))
+  httr::GET(url=dtdUrl, httr::write_disk(dtdFile, overwrite=TRUE))
+  logf('Downloaded XML and DTD')
+}
 
 # read XML with validation
 xmlObj <- xmlParse(xmlFile, validate=TRUE)
@@ -545,7 +561,8 @@ if (do_ingest_xml) {
   # --- Save output
   if (do_save_csvs) {
     # save results of ingestion to working directory
-    # NOTE: if we want to make these files 'canonical', copy them to the data directory
+    # NOTE: If we want to make these files 'canonical', and use `do_ingest_xml=FALSE`,
+    #       we must copy them to the 'data' sub-directory of the working directory.
     write.csv(journal_df, 'journal_df.csv', row.names=FALSE)
     write.csv(author_df, 'author_df.csv', row.names=FALSE)
     write.csv(article_df, 'article_df.csv', row.names=FALSE)
@@ -555,7 +572,7 @@ if (do_ingest_xml) {
     log('Skipped saving CSVs')
   }
 } else {
-  # load extant 'canonical' CSVs from data directory
+  # load extant 'canonical' CSVs from 'data' directory
   journal_df <- read.csv('data/journal_df.csv')
   author_df <- read.csv('data/author_df.csv')
   article_df <- read.csv('data/article_df.csv')
