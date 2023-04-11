@@ -1,7 +1,3 @@
-
-# clean the environment
-rm(list=ls())
-
 # config/options
 do_ingest_xml <- TRUE
 do_save_csvs <- TRUE
@@ -26,6 +22,11 @@ library(RSQLite)
 library(httr)
 
 # confirm dependencies
+# This script was developed with the following versions:
+#   * R: R version 4.2.1 (2022-06-23)
+#   * XML: 3.99.0.14
+#   * RSQLite: 2.3.0
+#   * httr: 1.4.5
 print(sprintf('R: %s', R.version.string))
 for (dep in deps) {
   print(sprintf('%s: %s', dep, packageVersion(dep)))
@@ -38,6 +39,21 @@ dbFile <- 'pubmed.db'
 schemaFile <- 'oltp_schema.sql'
 
 # --- Part 1.5: Realize the schema
+# download the OLTP schema
+schemaUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/oltp_schema.sql'
+if (do_http_cache) {
+  if (file.exists(schemaFile)) {
+    logf('Using cached OLTP schema: %s', normalizePath(schemaFile))
+  } else {
+    httr::GET(url=schemaUrl, httr::write_disk(schemaFile))
+    logf('Downloaded OLTP schema')
+  }
+} else {
+  httr::GET(url=schemaUrl, httr::write_disk(schemaFile, overwrite=TRUE))
+  logf('Downloaded OLTP schema')
+}
+
+# open the database connection and create the schema
 db_init <- function() {
   # clear extant DB
   unlink(dbFile)
