@@ -1,11 +1,18 @@
 # clean the environment
 rm(list=ls())
 
+# simple logging
+logf <- function(s, ...) {
+  print(Sys.time())
+  cat(sprintf(paste(s, "\n", sep=""), ...))
+}
+
 # install dependencies
 deps <- c('XML', 'RSQLite', 'httr')
 missingDeps <- setdiff(deps, installed.packages()[,'Package'])
 if (length(missingDeps)) {
   install.packages(missingDeps)
+  logf('Installed %s missing packages', length(missingDeps))
 }
 
 library(XML)
@@ -28,9 +35,15 @@ xmlUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/pubmed.x
 httr::GET(url=xmlUrl, httr::write_disk(xmlFile))
 dtdUrl <- 'https://raw.githubusercontent.com/jhautala/CS5200-prax2/main/pubmed.dtd'
 httr::GET(url=dtdUrl, httr::write_disk(dtdFile))
+logf('Downloaded XML and DTD')
 
-# read XML and open DB connection
+# read XML with validation
 xmlObj <- xmlParse(xmlFile, validate=TRUE)
+logf('Parsed XML with validation')
+
+# smaller file for testing
+# xmlObj <- xmlParse('pubmed_sample.xml', validate=TRUE)
+# xmlObj <- xmlParse('pms2.xml', validate=TRUE)
 
 # --- XML extraction utilities
 extract_value <- function(node, xpath) {
@@ -111,8 +124,8 @@ setClass(
     cited_medium='character',
     title='character',
     iso_abbrev='character',
-    volume='integer',
-    issue='integer',
+    volume='character',
+    issue='character',
     pub_year='integer',
     pub_month='integer',
     pub_day='integer',
@@ -141,8 +154,8 @@ JournalXmlDto <- function(journal_node) {
   cited_medium <- NA_character_
   title <- NA_character_
   iso_abbrev <- NA_character_
-  volume <- NA_integer_
-  issue <- NA_integer_
+  volume <- NA_character_
+  issue <- NA_character_
   pub_year <- NA_integer_
   pub_month <- NA_integer_
   pub_day <- NA_integer_
@@ -164,8 +177,8 @@ JournalXmlDto <- function(journal_node) {
   journal_issue_node <- extract_node(journal_node, "JournalIssue")
   if (!is.null(journal_issue_node)) {
     cited_medium <- xmlGetAttr(journal_issue_node, "CitedMedium")
-    volume <- extract_integer(journal_issue_node, 'Volume')
-    issue <- extract_integer(journal_issue_node, 'Issue')
+    volume <- extract_value(journal_issue_node, 'Volume')
+    issue <- extract_value(journal_issue_node, 'Issue')
     
     # extract PubDate (Year, Month, Day, Season, MedlineDate)
     pubdate_node <- extract_node(journal_issue_node, 'PubDate')
@@ -289,14 +302,22 @@ authors <- list()
 journals <- list()
 articles <- list()
 article_authors <- list()
-pmids <- lapply(xmlChildren(xmlObj[['/Publications']]), function(x) xmlGetAttr(x, 'PMID'))
-for (pmid in pmids) {
+article_id <- 0
+logf('Starting ingestion')
+for (article_node in xpathSApply(xmlObj, '//Article')) {
+  article_id <- article_id + 1
+  pmid <- xmlGetAttr(article_node, 'PMID')
+  if (is.null(pmid)) {
+    message(sprintf('Missing "PMID" for article element %s', article_id))
+    next
+  }
+  
   # initialize primary keys
   journal_id <- NA
   
   details_node <- extract_node(
-    xmlObj,
-    sprintf('/Publications/Article[@PMID="%s"]/PubDetails', pmid),
+    article_node,
+    'PubDetails',
     sprintf('"PubDetails" for PMID="%s"', pmid)
   )
   if (is.null(details_node)) {
@@ -382,9 +403,18 @@ for (pmid in pmids) {
     author_list_complete=author_list_complete
   )
 }
+logf('Finished ingestion')
 
 # create author dataframe
-author_cols <- c("last_name", "first_name", "initials", "suffix", "collective_name", "affiliation")
+author_cols <- c(
+  "author_id",
+  "last_name",
+  "first_name",
+  "initials",
+  "suffix",
+  "collective_name",
+  "affiliation"
+)
 author_mat <- matrix(
   NA,
   nrow=length(authors),
@@ -393,6 +423,7 @@ author_mat <- matrix(
 )
 for (i in seq_along(authors)) {
   author <- authors[[i]]
+  author_mat[i, 'author_id'] <- i
   author_mat[i, 'last_name'] <- author@last_name
   author_mat[i, 'first_name'] <- author@first_name
   author_mat[i, 'initials'] <- author@initials
@@ -401,20 +432,7 @@ for (i in seq_along(authors)) {
   author_mat[i, 'affiliation'] <- author@affiliation
 }
 author_df <- data.frame(author_mat, stringsAsFactors=FALSE)
-
-# author_df <- do.call(rbind, lapply(authors, function(author) {
-#   list(
-#     last_name = author@last_name,
-#     first_name = author@first_name,
-#     initials = author@initials,
-#     suffix = author@suffix,
-#     collective_name = author@collective_name,
-#     affiliation = author@affiliation
-#   )
-# }))
-# author_df <- data.frame(author_df, stringsAsFactors=FALSE, row.names=NULL)
-# str(author_df)
-# print(author_df)
+logf('Created author data frame (nrow=%s; ncol=%s)', nrow(author_df), ncol(author_df))
 
 # create journal dataframe
 journal_df <- do.call(rbind, lapply(journals, function(j) {
@@ -426,9 +444,10 @@ journal_df <- do.call(rbind, lapply(journals, function(j) {
   )
 }))
 journal_df$issn <- row.names(journal_df)
-row.names(journal_df) <- NULL
-journal_df <- journal_df[,c('issn', 'issn_type', 'title', 'iso_abbrev')]
-print(journal_df)
+row.names(journal_df) <- NULL # reset the index
+journal_df$journal_id <- seq(nrow(journal_df)) # establish journal IDs
+journal_df <- journal_df[,c('journal_id', 'issn', 'issn_type', 'title', 'iso_abbrev')]
+logf('Created journal data frame (nrow=%s; ncol=%s)', nrow(journal_df), ncol(journal_df))
 
 # create article dataframe
 article_df <- do.call(rbind, lapply(articles, function(a) {
@@ -452,7 +471,7 @@ article_df$pmid <- row.names(article_df)
 row.names(article_df) <- NULL
 cols <- colnames(article_df)
 article_df <- article_df[, c(cols[length(cols)], cols[1:length(cols)-1])]
-print(article_df)
+logf('Created article data frame (nrow=%s; ncol=%s)', nrow(article_df), ncol(article_df))
 
 # create join table for authors to articles
 article_author_df <- do.call(rbind, lapply(article_authors, function(aa) {
@@ -464,15 +483,34 @@ article_author_df <- do.call(rbind, lapply(article_authors, function(aa) {
     row.names=NULL
   )
 }))
-print(article_author_df)
+logf(
+  'Created article_author data frame (nrow=%s; ncol=%s)',
+  nrow(article_author_df),
+  ncol(article_author_df)
+)
 
-
-save(journal_df, file='journal_df.Rda')
-save(author_df, file='author_df.Rda')
-save(article_df, file='article_df.Rda')
-save(article_author_df, file='article_author_df.Rda')
-
+# save results of ingestion
 write.csv(journal_df, 'journal_df.csv')
 write.csv(author_df, 'author_df.csv')
 write.csv(article_df, 'article_df.csv')
 write.csv(article_author_df, 'article_author_df.csv')
+
+journal_df <- read.csv('data/draft1/journal_df.csv')
+author_df <- read.csv('data/draft1/author_df.csv')
+article_df <- read.csv('data/draft1/article_df.csv')
+article_author_df <- read.csv('data/draft1/article_author_df.csv')
+
+dff <- list(
+  journal_df=journal_df,
+  article_author_df=article_author_df,
+  article_df=article_df,
+  author_df=author_df
+)
+for (df_name in names(dff)) {
+  print(df_name)
+  df <- dff[[df_name]]
+  for (col in colnames(df)) {
+    na_count <- sum(is.na(df[[col]]))
+    print(sprintf('  %s: %s', col, na_count))
+  }
+}
