@@ -534,8 +534,7 @@ if (do_ingest_xml) {
         author_list_complete <- 'Y' == author_list_complete_YN
       }
       
-      author_nodes <- xmlChildren(author_list_node)
-      for (author_node in author_nodes) {
+      for (author_node in xmlChildren(author_list_node)) {
         author_xml_dto <- AuthorXmlDto(author_node)
         author_uid <- xml_dto_id(author_xml_dto)
         if (!exists(author_uid, where=authors)) {
@@ -670,6 +669,15 @@ logf(
   sum(missing_article_mask),
   sum(missing_author_mask & missing_article_mask)
 )
+
+# TODO: Deduplicate journals with same title/iso_abbrev?
+#       There seem to be some cadndidates, and it seems the `issn_type` doesn't necessarily
+#       distinguish distinct journals. Leaving as-is for now, with a bit of code to assess
+#       opportunity for deduping.
+dupe_titles <- journal_df[duplicated(journal_df$title), 'title']
+dupe_abbrev <- journal_df[duplicated(journal_df$iso_abbrev), 'iso_abbrev']
+dupe_journal_df <- journal_df[(journal_df$title %in% dupe_titles | journal_df$iso_abbrev %in% dupe_abbrev),]
+print(dupe_journal_df[order(dupe_journal_df$title),])
 
 # Execute inserts
 tbls <- list(
