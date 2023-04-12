@@ -368,24 +368,26 @@ list_to_author_df <- function(authors) {
     "collective_name",
     "affiliation"
   )
-  author_mat <- matrix(
-    NA,
-    nrow=length(authors),
-    ncol=length(author_cols),
-    dimnames=list(NULL, author_cols)
-  )
-  for (i in seq_along(authors)) {
-    author <- authors[[i]]
-    author_mat[i, 'author_id'] <- i
-    author_mat[i, 'last_name'] <- author@last_name
-    author_mat[i, 'first_name'] <- author@first_name
-    author_mat[i, 'initials'] <- author@initials
-    author_mat[i, 'suffix'] <- author@suffix
-    author_mat[i, 'collective_name'] <- author@collective_name
-    author_mat[i, 'affiliation'] <- author@affiliation
+  author_df <- data.frame(matrix(ncol = length(author_cols), nrow = length(authors)))
+  colnames(author_df) <- author_cols
+  
+  # add the ID column
+  author_df$author_id <- seq_along(authors)
+  
+  # copy the string columns
+  i <- 0
+  for (author in authors) {
+    i <- i + 1
+    author_df[i, 'last_name'] <- author@last_name
+    author_df[i, 'first_name'] <- author@first_name
+    author_df[i, 'initials'] <- author@initials
+    author_df[i, 'suffix'] <- author@suffix
+    author_df[i, 'collective_name'] <- author@collective_name
+    author_df[i, 'affiliation'] <- author@affiliation
   }
-  author_df <- data.frame(author_mat, stringsAsFactors=FALSE)
-  author_df$author_id <- as.integer(author_df$author_id)
+  
+  # Convert the data frame to strings without factors
+  author_df <- data.frame(author_df, stringsAsFactors = FALSE)
   return(author_df)
 }
 
@@ -423,10 +425,26 @@ list_to_article_df <- function(articles) {
       row.names=NULL
     )
   }))
-  article_df$pmid <- row.names(article_df)
+  
+  # assign IDs
+  article_df$pmid <- as.integer(names(articles))
+  # reset index
   row.names(article_df) <- NULL
+  # reorder columns to put primary key first
   cols <- colnames(article_df)
   article_df <- article_df[, c(cols[length(cols)], cols[1:length(cols)-1])]
+  
+  # correct all the data types that were lost due to due to using a list of vectors
+  # NOTE: A list of named lists seems more elegant (especially with dplyr's `bind_rows`),
+  #       but I haven't been able to figure out why ir produces fewer rows... alas!
+  article_df$journal_id <- as.integer(article_df$journal_id)
+  article_df$pub_year <- as.integer(article_df$pub_year)
+  article_df$pub_month <- as.integer(article_df$pub_month)
+  article_df$pub_day <- as.integer(article_df$pub_day)
+  article_df$author_list_complete <- as.integer(as.logical(article_df$author_list_complete))
+  
+  # NOTE: here we must conform to SQLite's implementation of Boolean type
+  article_df$author_list_complete <- as.integer(article_df$author_list_complete)
   return(article_df)
 }
 
@@ -460,9 +478,6 @@ if (do_ingest_xml) {
       next
     }
     pmid <- as.integer(pmid)
-    
-    # initialize primary keys
-    journal_id <- NA
     
     details_node <- extract_node(
       article_node,
@@ -516,7 +531,7 @@ if (do_ingest_xml) {
       author_list_complete_YN <- xmlGetAttr(author_list_node, 'CompleteYN')
       if (!is.null(author_list_complete_YN)) {
         # NOTE: here we accommodate SQLite data type
-        author_list_complete <- if ('Y' == author_list_complete_YN) 1 else 0
+        author_list_complete <- 'Y' == author_list_complete_YN
       }
       
       author_nodes <- xmlChildren(author_list_node)
@@ -539,7 +554,7 @@ if (do_ingest_xml) {
       }
     }
     
-    articles[[pmid]] = c(
+    articles[[as.character(pmid)]] <- c(
       journal_id=journal_id,
       article_title=article_title,
       cited_medium=journal_xml_dto@cited_medium,
@@ -562,7 +577,6 @@ if (do_ingest_xml) {
   journal_df <- list_to_journal_df(as.list(journals))
   logf('Created journal data frame (nrow=%s; ncol=%s)', nrow(journal_df), ncol(journal_df))
   
-  # create article dataframe
   article_df <- list_to_article_df(articles)
   logf('Created article data frame (nrow=%s; ncol=%s)', nrow(article_df), ncol(article_df))
   
@@ -579,6 +593,8 @@ if (do_ingest_xml) {
     # save results of ingestion to working directory
     # NOTE: If we want to make these files 'canonical', and use `do_ingest_xml=FALSE`,
     #       we must copy them to the 'data' sub-directory of the working directory.
+    # IMPORTANT: The only cleanup we've done in creating these data frames is to ensure
+    #            that articles have 'PMID' and journals have 'ISSN'.
     write.csv(journal_df, 'journal_df.csv', row.names=FALSE)
     write.csv(author_df, 'author_df.csv', row.names=FALSE)
     write.csv(article_df, 'article_df.csv', row.names=FALSE)
