@@ -10,7 +10,7 @@ logf <- function(s, ...) {
 }
 
 # install dependencies
-deps <- c('XML', 'RSQLite', 'httr')
+deps <- c('XML', 'RSQLite', 'httr', 'stringr')
 missingDeps <- setdiff(deps, installed.packages()[,'Package'])
 if (length(missingDeps)) {
   install.packages(missingDeps)
@@ -20,6 +20,7 @@ if (length(missingDeps)) {
 library(XML)
 library(RSQLite)
 library(httr)
+library(stringr)
 
 # confirm dependencies
 # This script was developed with the following versions:
@@ -157,6 +158,37 @@ extract_node <- function(node, xpath, desc=NA) {
   return(nodes[[1]])
 }
 
+# establish a regex for parsing months to integers
+extract_month <- function(node, xpath) {
+  month_string <- extract_value(node, xpath)
+  if (is.na(month_string)) {
+    return(NA_integer_)
+  }
+  
+  # check for month.abb (expected case)
+  month_string <- str_to_title(month_string)
+  month_integer <- which(month.abb == month_string)
+  if (length(month_integer)) {
+    return(month_integer)
+  }
+  
+  # check for integer month (encountered case)
+  # NOTE: we cannot simply check for `NA`; the string 'NAN' is
+  #       coerced differently from other non-numeric strings...
+  month_integer <- suppressWarnings(as.integer(month_string))
+  if (!is.na(month_integer) && month_integer > 0 && month_integer < 13) {
+    return(month_integer)
+  }
+  
+  # check for month.name (may as well)
+  month_integer <- which(month.name == month_string)
+  if (length(month_integer)) {
+    return(month_integer)
+  }
+  
+  return(NA_integer_)
+}
+
 # --- Define DTOs and DTO-specific utility functions
 # a generic function for getting a unique identifier string from an XML DTO model
 setGeneric(
@@ -235,11 +267,11 @@ JournalXmlDto <- function(journal_node) {
     pubdate_node <- extract_node(journal_issue_node, 'PubDate')
     if (!is.null(pubdate_node)) {
       pub_year <- extract_integer(pubdate_node, 'Year')
-      pub_month <- match(extract_value(pubdate_node, 'Month'), month.abb)
+      pub_month <- extract_month(pubdate_node, 'Month')
       pub_day <- extract_integer(pubdate_node, 'Day')
       pub_season <- extract_value(pubdate_node, 'Season')
+      # NOTE: we preserve medline date exactly as it is; we will parse it further during ETL
       medline_date <- extract_value(pubdate_node, 'MedlineDate')
-      # TODO: add cases to extract what we can from MedlineDate?
     }
   }
   
@@ -612,6 +644,16 @@ if (do_ingest_xml) {
 }
 
 # --- Write data frames to SQLite
+# TODO: Deduplicate journals with same title/iso_abbrev?
+#       There seem to be some cadndidates, and it seems the `issn_type` doesn't necessarily
+#       distinguish distinct journals. Leaving as-is for now, with a bit of code to assess
+#       opportunity for deduping.
+# NOTE: Such a solution would require updating journal IDs to preclude orphans.
+dupe_titles <- journal_df[duplicated(journal_df$title), 'title']
+dupe_abbrev <- journal_df[duplicated(journal_df$iso_abbrev), 'iso_abbrev']
+dupe_journal_df <- journal_df[(journal_df$title %in% dupe_titles | journal_df$iso_abbrev %in% dupe_abbrev),]
+print(dupe_journal_df[order(dupe_journal_df$title),])
+
 # filter out journals missing 'issn'
 # NOTE: Since we do not assign journal IDs to journals missing 'ISSN' during ingestion,
 #       we do not have to worry about breaking any links by deleting them here.
@@ -670,14 +712,10 @@ logf(
   sum(missing_author_mask & missing_article_mask)
 )
 
-# TODO: Deduplicate journals with same title/iso_abbrev?
-#       There seem to be some cadndidates, and it seems the `issn_type` doesn't necessarily
-#       distinguish distinct journals. Leaving as-is for now, with a bit of code to assess
-#       opportunity for deduping.
-dupe_titles <- journal_df[duplicated(journal_df$title), 'title']
-dupe_abbrev <- journal_df[duplicated(journal_df$iso_abbrev), 'iso_abbrev']
-dupe_journal_df <- journal_df[(journal_df$title %in% dupe_titles | journal_df$iso_abbrev %in% dupe_abbrev),]
-print(dupe_journal_df[order(dupe_journal_df$title),])
+# check relationship between cited_medium and issn_type
+merged_df <- merge(article_df, journal_df, by='journal_id')
+combos <- unique(paste(merged_df$cited_medium, merged_df$issn_type, sep=':'))
+print(paste(combos))
 
 # Execute inserts
 tbls <- list(
