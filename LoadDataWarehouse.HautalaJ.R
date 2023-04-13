@@ -110,78 +110,61 @@ sql_query <- (
 )
 
 # some utility functions for parsing MedlineDate
-optional_range <- function(s) {
-  return(sprintf('(%s)(-%s)?', s, s))
+optional_range <- function(s, is_group=FALSE) {
+  if (is_group) {
+    return(sprintf('(%s)(-(%s))?', s, s))
+  } else {
+    return(sprintf('(%s)(-%s)?', s, s))
+  }
 }
 
 year_regex <- regex(optional_range('\\d{4}'))
-month_regex <- regex(optional_range(paste(month.abb, collapse='|')), ignore_case=TRUE)
+month_regex <- regex(optional_range(paste(month.abb, collapse='|'), is_group=TRUE), ignore_case=TRUE)
 day_regex <- regex('(?<!\\d)(\\d{1,2})(-\\d{1,2})?(?!\\d)')
-season_regex <- regex(optional_range('Spring|Summer|Winter|Fall'), ignore_case=TRUE)
-ymds_regexes <- c(year_regex, month_regex, day_regex, season_regex)
+season_regex <- regex(optional_range('Spring|Summer|Winter|Fall', is_group=TRUE), ignore_case=TRUE)
+ymds_regexes <- list(year_regex, month_regex, day_regex, season_regex)
 
-extract_ymds <- function(medline_dates, pub_year, pub_month, pb_day, pub_season) {
-  # create a matrix, populated with existing years and seasons
-  ymds <- cbind(pub_year, pub_month, pub_day, pub_season)
+extract_ymds <- function(medline_date) {
+  # create a matrix to hold the extracted YMDS
+  ymds <- matrix(NA, nrow=length(medline_date), ncol=length(ymds_regexes))
+  
+  # populate each column
   for (col in seq_along(ymds_regexes)) {
     curr_regex <- ymds_regexes[[col]]
-    capture_result <- str_match(medline_dates, curr_regex)
-    is_valid <- is.na(ymds[, col]) & !is.na(capture_result[, 1])
-    ymds[is_valid, col] <- capture_result[is_valid, 2]
+    ymds[, col] <- str_match(medline_date, curr_regex)[, 2]
   }
   
   return(ymds)
 }
 
-# function to extract timestamps as start of meteorological season
-season_dates <- function(pub_year, pub_season) {
-  start_date <- switch(
-    pub_season,
-    "Spring" = ymd(paste(pub_year, "03", "01", sep = "-")),
-    "Summer" = ymd(paste(pub_year, "06", "01", sep = "-")),
-    "Fall" = ymd(paste(pub_year, "09", "01", sep = "-")),
-    "Winter" = ymd(paste(pub_year, "12", "01", sep = "-"))
-  )
-  return(start_date)
+extract_md <- function(pub_season) {
+  md <- matrix(NA, nrow=length(pub_season), ncol=2)
+  seasons <- c("Spring", "Summer", "Fall", "Winter")
+  season_starts <- list(c(3, 1), c(6, 1), c(9, 1), c(12, 1))
+  
+  for (i in seq_along(seasons)) {
+    idx <- which(pub_season == seasons[i])
+    md[idx, ] <- matrix(
+      rep(season_starts[[i]], length(idx)),
+      nrow=length(idx),
+      byrow=TRUE
+    )
+  }
+  
+  return(md)
 }
 
-# vectorized
-season_dates_vec <- Vectorize(season_dates, vectorize.args = c("pub_year", "pub_season"))
-
-
-
-
-# Usage example
-years <- c(2021, 2022, 2023)
-seasons <- c("Spring", "Summer", "Fall")
-dates <- season_dates_vec(years, seasons)
-
-# Convert the result into a data frame with columns "start_date", "mid_date", "end_date"
-dates_df <- data.frame(t(matrix(dates, nrow = 3, dimnames = list(c("start_date", "mid_date", "end_date")))))
-
-count_date_fields <- function(df) {
-  has_day <- !(is.na(df$pub_day))
-  has_month <- !(is.na(df$pub_month))
-  has_year <- !(is.na(df$pub_year))
-  has_season <- !(is.na(df$pub_season))
-  print(paste(
-    'has day:', sum(has_day), ';',
-    'has month:', sum(has_month), ';',
-    'has years:', sum(has_year), ';',
-    'has season:', sum(has_season)
-  ))
+# a function to help keep track of imputed/inferred date info
+count_ymds <- function(df) {
+  row <- list()
+  for (col in c('pub_year', 'pub_month', 'pub_day', 'pub_season')) {
+    row[[col]] <- sum(!is.na(df[, col]))
+  }
+  return(row)
 }
-count_date_fields(article_df)
-count_date_fields(results_df)
 
-has_month <- !(is.na(article_df$pub_month))
-has_year <- !(is.na(article_df$pub_year))
-has_season <- !(is.na(article_df$pub_season))
-print(paste(
-  'has years:', sum(has_year), ';',
-  'has month:', sum(has_month), ';',
-  'has season:', sum(has_season)
-))
+
+# --- scratch
 journal_df <- read.csv('data/journal_df.csv')
 author_df <- read.csv('data/author_df.csv')
 article_df <- read.csv('data/article_df.csv')
@@ -189,7 +172,6 @@ article_author_df <- read.csv('data/article_author_df.csv')
 results_df <- merge(article_df, journal_df, by=c('journal_id'))
 # results_df <- merge(results_df, author_df, by=c('author_id'))
 results_df <- read.csv('data/article_df.csv')
-
 
 
 
@@ -209,42 +191,116 @@ while (!dbHasCompleted(result)) {
     break
   }
   
+  # ymds pre-count
+  ymd_counts <- count_ymds(results_df)
+  
   # get what we can from medline_date
-  results_df[, c('pub_year', 'pub_month', 'pub_day', 'pub_season')] <- extract_ymds(
-    results_df$medline_date,
-    results_df$pub_year,
-    results_df$pub_month,
-    results_df$pub_day,
-    results_df$pub_season
-  )
+  ymds <- extract_ymds(results_df$medline_date)
+  results_df <- results_df %>%
+    mutate(
+      pub_year = ifelse(is.na(pub_year), ymds[, 1], pub_year),
+      pub_month = ifelse(is.na(pub_month), ymds[, 2], pub_month),
+      pub_day = ifelse(is.na(pub_day), ymds[, 3], pub_day),
+      pub_season = ifelse(is.na(pub_season), ymds[, 4], pub_season)
+    )
+  
   
   # apply title case to the month and season
   results_df$pub_month <- str_to_title(results_df$pub_month)
   results_df$pub_season <- str_to_title(results_df$pub_season)
   
+  # check results
+  logf('Extracted YMDS from medline_date:')
+  ymd_counts <- rbind(ymd_counts, parse_medline=count_ymds(results_df))
+  print(ymd_counts)
+  
+  # check hierarchy of YMDS
+  has_day <- !(is.na(results_df$pub_day))
+  has_month <- !(is.na(results_df$pub_month))
+  has_year <- !(is.na(results_df$pub_year))
+  has_season <- !(is.na(results_df$pub_season))
+  
+  # should be zero
+  tmp <- sum(has_season & !has_year)
+  if (tmp) {
+    logf('Encountered Season without Year: %s', tmp)
+  }
+  tmp <- sum(has_month & !has_year)
+  if (tmp) {
+    logf('Encountered Month without Year: %s', tmp)
+  }
+  tmp <- sum(has_day & !has_year)
+  if (tmp) {
+    logf('Encountered Day without Year: %s', tmp)
+  }
+  tmp <- sum(has_day & !has_month)
+  if (tmp) {
+    logf('Encountered Day without Month: %s', tmp)
+  }
+  tmp <- sum(has_season & has_day)
+  if (tmp) {
+    logf('Encountered Season with Day: %s', tmp)
+  }
+  tmp <- sum(has_season & has_month)
+  if (tmp) {
+    logf('Encountered Season with Month: %s', tmp)
+  }
+  
+  # check for opportunities to infer dates from Season and Year
+  tmp <- sum(has_season & (!has_month | !has_day))
+  if (tmp) {
+    logf('Encountered %s opportunities to infer Month/Day from Season.', tmp)
+  }
+  md <- extract_md(results_df$pub_season)
+  results_df <- results_df %>%
+    mutate(
+      pub_month = ifelse(is.na(pub_month), md[, 1], pub_month),
+      pub_day = ifelse(is.na(pub_day), md[, 2], pub_day)
+    )
+  
+  logf('Extracted MD from Season:')
+  ymd_counts <- rbind(ymd_counts, season_start=count_ymds(results_df))
+  print(ymd_counts)
+  
+  # reset counts
+  has_day <- !(is.na(results_df$pub_day))
+  has_month <- !(is.na(results_df$pub_month))
+  has_year <- !(is.na(results_df$pub_year))
+  has_season <- !(is.na(results_df$pub_season))
+  
+  tmp <- sum(has_year & (!has_month & !has_day))
+  if (tmp) {
+    logf('Encountered %s opportunities to infer Month/Day from Year', tmp)
+  }
+  results_df <- results_df %>%
+    mutate(
+      pub_month = ifelse(is.na(pub_month), 1, pub_month),
+      pub_day = ifelse(is.na(pub_day), 1, pub_day)
+    )
+  logf('Inferred MD from Year:')
+  ymd_counts <- rbind(ymd_counts, year_start=count_ymds(results_df))
+  print(ymd_counts)
+  
+  # ymd_counts:
+  #   pub_year pub_month pub_day pub_season
+  #   ymd_counts    27367    21803     7494    86        
+  #   parse_medline 30000    24425     7586    89        
+  #   season_start  30000    24514     7675    89        
+  #   year_start    30000    30000     30000   89        
+  
   # derive some actual timestamps from date fields
   results_df$pub_date <- NA
-  results_df$pub_date <- as.Date(results_df$pub_date)
   
   # fill in the date as well as we can with YMD
   results_df <- results_df %>%
     mutate(
       pub_date = case_when(
-        !is.na(pub_day) ~ ymd(paste(pub_year, pub_month, pub_day, sep = "-")),
-        !is.na(pub_month) ~ ymd(paste(pub_year, pub_month, "01", sep = "-")),
-        !is.na(pub_year) ~ ymd(paste(pub_year, "01", "01", sep = "-")),
+        !is.na(pub_year) & !is.na(pub_month) & !is.na(pub_day) ~ ymd(paste(pub_year, pub_month, pub_day, sep = "-")),
+        !is.na(pub_year) & !is.na(pub_month)                   ~ ymd(paste(pub_year, pub_month, "01", sep = "-")),
+        !is.na(pub_year)                                       ~ ymd(paste(pub_year, "01", "01", sep = "-")),
         TRUE ~ NA
       )
     )
-  
-  # also fill in date with season
-  # TODO: finish adapting this to our data
-  years <- c(2021, 2022, 2023)
-  seasons <- c("Spring", "Summer", "Fall")
-  dates <- season_dates_vec(years, seasons)
-  
-  # Convert the result into a data frame with columns "start_date", "mid_date", "end_date"
-  dates_df <- data.frame(t(matrix(dates, nrow = 3, dimnames = list(c("start_date", "mid_date", "end_date")))))
 }
 
 # close the result set
