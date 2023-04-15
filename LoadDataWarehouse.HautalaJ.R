@@ -70,23 +70,20 @@ for (dep in deps) {
 
 # IMPORTANT: Initial DB setup requires at least three things:
 #   
-#   1. `db_admin_user`: the name of the root user account for your DB server
-#   2. `db_admin_pass`: the password for your root user
-#   3. `db_owner_pass`: the password to use for the "DB owner" login user account
+#   1. `db_user`: the name of the root user account for your DB server
+#   2. `db_pass`: the password for your root user
 # 
 # It is simplest to create a YAML credentials file named 'db_cred.yml' in the
 # working directory, alongside this script.
 # 
 # NOTE:
+#   * It is not strictly required that you use your root account, but significant privileges are required.
 #   * Replace asterisks with your names and passwords.
 #   * The final line in the file must be empty.
 # 
 # ### YAML file structure
 # ```yaml
 # db_admin:
-#   name: ************
-#   pass: ************
-#   db_owner:
 #   name: ************
 #   pass: ************
 # 
@@ -415,7 +412,8 @@ insert_batch = function(results_df) {
       
       # log progress
       logf('Inserted new facts:')
-      print(do.call(rbind, lapply(row_counts, as.data.frame)))
+      counts_df <- setNames(do.call(rbind, lapply(row_counts, as.data.frame)), "count")
+      print(counts_df)
       
       return(row_counts)
     },
