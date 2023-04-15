@@ -2,6 +2,33 @@
 #       the OLAP DB, it is not suitable for deployment where the OLAP DB needs to be
 #       "long-lived" (i.e. iteratively appended to over time).
 
+# Acknowledgments: I used GPT-4 extensively during development of this script, primarily
+#   as a way to sift through the R documentation and discover language/library features.
+#   It proved indispensable for parsing stacktraces (or "tracebacks") and learning more
+#   about R syntax, particularly around vectorized operations, dealing with named lists,
+#   and some common R functions (e.g. `lapply`, `(r|c)bind`, etc.).
+#
+#   The main thing I would have done differently without feedback from GPT-4 is that I
+#   would have avoided some dependencies, specifically 'dplyr' and 'lubridate'.
+#   I have a strong bias to avoid dependencies in favor of "base R", but after seeing
+#   examples of how to use some of the functions and operators provided therein, I was
+#   convinced of their value. To be fair most of my concerns (e.g. namespace masking)
+#   are fairly easily addressed, and this is part of the process of gaining familiarity
+#   with a language and conventional libraries.
+#
+#   More specifically, I would not have used the `mutate` function without GPT's
+#   prompting (so to speak), and though I didn't take any code directly from GPT unmodified,
+#   this line in particular would not exist without the responses I got from GPT:
+#
+#   `results_df <- results_df %>% mutate(across(names(ymds), ~coalesce(., ymds[[cur_column()]])))`
+#
+#   As a basis for comparison, the reader may review the implementation of "LoadXML2DB.HautalaJ.R",
+#   paying particular attention to the more verbose/explicit, and less-than-elegant statements
+#   I used there to create vectors, lists and data frames. Each occurrence of a column name or table
+#   name in the code represents an increased liability in the form of a roadblock to change/adaptation;
+#   it is much easier to modify the schema if you only have to change a couple of variables/references
+#   when the schema changes.
+
 do_http_cache <- TRUE
 batch_size <- 4096
 

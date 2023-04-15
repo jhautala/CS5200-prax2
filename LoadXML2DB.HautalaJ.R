@@ -468,7 +468,7 @@ list_to_article_df <- function(articles) {
   
   # correct all the data types that were lost due to due to using a list of vectors
   # NOTE: A list of named lists seems more elegant (especially with dplyr's `bind_rows`),
-  #       but I haven't been able to figure out why ir produces fewer rows... alas!
+  #       but I haven't been able to figure out why it produces fewer rows... alas!
   article_df$journal_id <- as.integer(article_df$journal_id)
   article_df$pub_year <- as.integer(article_df$pub_year)
   article_df$pub_month <- as.integer(article_df$pub_month)
