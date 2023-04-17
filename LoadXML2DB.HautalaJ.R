@@ -604,7 +604,7 @@ if (do_ingest_xml) {
       author_list_complete=author_list_complete
     )
   }
-  logf('Finished ingestion')
+  logf('Finished extraction')
   
   # --- Conversion to data frames
   author_df <- list_to_author_df(as.list(authors))
