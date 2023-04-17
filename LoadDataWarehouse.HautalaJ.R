@@ -225,6 +225,8 @@ simpleErrorLogger = function(cond) {
 }
 
 # util function for inserting dimensions the into OLAP DB
+# NOTE: Since there is no way to batch insert and efficiently retrieve the surrogate
+#       keys, we must insert each row, one at a time.
 insert_dim <- function(
     dbcon,
     table_name,
@@ -295,10 +297,11 @@ insert_batch = function(results_df) {
       # start a new transaction
       dbBegin(olap_dbcon)
       
-      # --- extract dimensions from results
+      # --- insert dimensions first to get foreign keys
       pub_date_dim_df <- data.frame(results_df[, c(
         'pub_date',
         'pub_year',
+        'pub_quarter',
         'pub_month',
         'pub_day',
         'pub_season',
@@ -307,35 +310,24 @@ insert_batch = function(results_df) {
         'imputed_day',
         'imputed_season'
       )])
-      journal_dim_df <- results_df %>%
-        select(journal_id, issn, issn_type, journal_title, iso_abbrev) %>%
-        rename(title = journal_title)
-      article_dim_df <- data.frame(results_df[, c(
-        'pmid',
-        'article_title',
-        'cited_medium',
-        'journal_volume',
-        'journal_issue',
-        'author_list_complete'
-      )])
-      author_dim_df <- data.frame(results_df[, c(
-        'author_id',
-        'last_name',
-        'first_name',
-        'initials',
-        'suffix',
-        'collective_name',
-        'affiliation'
-      )])
-      
-      # --- insert dimensions first to get foreign keys
       list[pub_date_dim_id, new_pub_dates] <- insert_dim(
         olap_dbcon,
         'dim.pub_date',
         'pub_date_dim_id',
-        colnames(pub_date_dim_df),
+        c(
+          'pub_date',
+          'pub_season',
+          'imputed_year',
+          'imputed_month',
+          'imputed_day',
+          'imputed_season'
+        ),
         pub_date_dim_df
       )
+      
+      journal_dim_df <- results_df %>%
+        select(journal_id, issn, issn_type, journal_title, iso_abbrev) %>%
+        rename(title = journal_title)
       list[journal_dim_id, new_journals] <- insert_dim(
         olap_dbcon,
         'dim.journal',
@@ -344,6 +336,14 @@ insert_batch = function(results_df) {
         journal_dim_df
       )
       
+      article_dim_df <- data.frame(results_df[, c(
+        'pmid',
+        'article_title',
+        'cited_medium',
+        'journal_volume',
+        'journal_issue',
+        'author_list_complete'
+      )])
       # NOTE: This wasn't working and I have no idea why.
       # article_dim_id <- insert_dim(
       #   olap_dbcon,
@@ -374,6 +374,15 @@ insert_batch = function(results_df) {
         dim_df
       )
       
+      author_dim_df <- data.frame(results_df[, c(
+        'author_id',
+        'last_name',
+        'first_name',
+        'initials',
+        'suffix',
+        'collective_name',
+        'affiliation'
+      )])
       list[author_dim_id, new_authors] <- insert_dim(
         olap_dbcon,
         'dim.author',
@@ -382,7 +391,7 @@ insert_batch = function(results_df) {
         author_dim_df
       )
       
-      # create fact data frame
+      # --- create fact data frame
       article_author_fact_df <- as.data.frame(
         cbind(
           pub_date_dim_id,
@@ -402,6 +411,7 @@ insert_batch = function(results_df) {
       )
       dbCommit(olap_dbcon)
       
+      # collect insert results
       row_counts <- list(
         new_pub_dates=sum(new_pub_dates),
         new_journals=sum(new_journals),
@@ -475,6 +485,7 @@ while (!dbHasCompleted(result)) {
   }
   
   # initialize imputed value flags to FALSE
+  # NOTE: quarter is always imputed
   results_df$imputed_year <- FALSE
   results_df$imputed_month <- FALSE
   results_df$imputed_day <- FALSE
@@ -596,6 +607,15 @@ while (!dbHasCompleted(result)) {
         !is.na(pub_year) & !is.na(pub_month)                   ~ ymd(paste(pub_year, pub_month, "01", sep = "-")),
         !is.na(pub_year)                                       ~ ymd(paste(pub_year, "01", "01", sep = "-")),
         TRUE ~ NA
+      ),
+      pub_quarter = case_when(
+        !is.na(pub_month) ~ifelse(
+          pub_month < 4, 1, ifelse(
+            pub_month < 7, 2, ifelse(
+              pub_month < 10, 3, ifelse(
+                pub_month < 13, 4, NA_integer_
+              )
+            )))
       )
     )
   

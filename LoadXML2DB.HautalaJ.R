@@ -1,3 +1,8 @@
+# NOTE: This OLTP schema is intended to be as close as possible to our upstream
+#       data. There is some cleanup/standardizing here, but the only assumption
+#       we intend to make is that articles must have journals. We do _not_
+#       assume that all articles must have authors.
+
 # config/options
 do_ingest_xml <- TRUE
 do_save_csvs <- TRUE
