@@ -24,10 +24,11 @@
 #
 #   As a basis for comparison, the reader may review the implementation of "LoadXML2DB.HautalaJ.R",
 #   paying particular attention to the more verbose/explicit, and less-than-elegant statements
-#   I used there to create vectors, lists and data frames. Each occurrence of a column name or table
-#   name in the code represents an increased liability in the form of a roadblock to change/adaptation;
-#   it is much easier to modify the schema if you only have to change a couple of variables/references
-#   when the schema changes.
+#   I used there to create vectors, lists and data frames. To some extent, each occurrence of a
+#   column name or table name in the code represents an increased liability in the form of roadblocks
+#   to change/adaptation, so though it is more complicated to use more generalized/abstract/dynamic
+#   coding practices, it is much easier to adapt to schema changes if we only have to change a
+#   variable names or string values in a few places.
 
 do_http_cache <- TRUE
 batch_size <- 4096
