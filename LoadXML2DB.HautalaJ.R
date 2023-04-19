@@ -396,6 +396,8 @@ AuthorXmlDto <- function(author_node) {
 # --- Ingestion loop
 n_missing_pmid <- 0
 n_missing_issn <- 0
+articles_missing_journals <- list()
+articles_missing_authors <- list()
 if (do_extract_xml) {
   # NOTE: we use environments for faster lookup of authors and journals
   authors_env <- new.env()
@@ -409,7 +411,7 @@ if (do_extract_xml) {
   for (article_node in xpathSApply(xmlObj, '//Article')) {
     article_seq <- article_seq + 1
     pmid <- xmlGetAttr(article_node, 'PMID')
-    if (is.null(pmid)) {
+    if (is.null(pmid) || is.na(pmid)) {
       n_missing_pmid <- n_missing_pmid + 1
       message(sprintf('Missing "PMID" for article element %s', article_seq))
       next
@@ -436,6 +438,7 @@ if (do_extract_xml) {
     )
     journal_xml_dto <- JournalXmlDto(journal_node)
     if (is.null(journal_xml_dto@issn) || is.na(journal_xml_dto@issn)) {
+      articles_missing_journals[[length(articles_missing_journals) + 1]] <- pmid
       n_missing_issn <- n_missing_issn + 1
       # establish a null reference for journal
       journal_id <- NA_integer_
@@ -467,7 +470,9 @@ if (do_extract_xml) {
     )
     
     author_list_complete <- NA
-    if (!is.null(author_list_node)) {
+    if (is.null(author_list_node)) {
+      articles_missing_authors[[length(articles_missing_authors) + 1]] <- pmid
+    } else {
       author_list_complete_YN <- xmlGetAttr(author_list_node, 'CompleteYN')
       if (!is.null(author_list_complete_YN) && !is.na(author_list_complete_YN)) {
         # NOTE: here we accommodate SQLite data type
@@ -634,7 +639,41 @@ if (do_extract_xml) {
   logf('Loaded extant CSVs')
 }
 
-# --- Cleanup analysis
+# --- Cleanup
+# TODO: Deduplicate journals with same title/iso_abbrev?
+#       There seem to be some cadndidates, and it seems the `issn_type` doesn't necessarily
+#       distinguish distinct journals. Leaving as-is for now, with a bit of code to assess
+#       opportunity for deduping.
+# NOTE: Such a solution would require updating journal IDs to preclude orphans.
+dupe_titles <- journal_df[duplicated(journal_df$title), 'title']
+dupe_abbrev <- journal_df[duplicated(journal_df$iso_abbrev), 'iso_abbrev']
+dupe_journal_df <- journal_df[(journal_df$title %in% dupe_titles | journal_df$iso_abbrev %in% dupe_abbrev),]
+print(dupe_journal_df[order(dupe_journal_df$title),])
+
+# filter out journals missing 'issn'
+# NOTE: Since we do not assign journal IDs to journals missing 'ISSN' during ingestion,
+#       we do not have to worry about breaking any links by deleting them here.
+#       However, as a matter of good practice (i.e. defensive programming), we
+#       grab some info here to make sure not to attempt to persist any such articles.
+missing_issn_mask <- is.na(journal_df$issn)
+missing_issn_df <- journal_df[missing_issn_mask,]
+missing_issn_df
+
+# Check to see if we can identify candidates for missing ISSN by title or iso_abbrev
+# TODO: Implement ISSN inference? It would be messy, and apparently not fruitful for the available data
+title_match_mask <- journal_df$title %in% missing_issn_df$title
+iso_abbrev_match_ask <- journal_df$iso_abbrev %in% missing_issn_df$iso_abbrev
+issn_inference_candidate_df <- journal_df[(!missing_issn_mask & (title_match_mask | iso_abbrev_match_ask)),]
+n_journals <- nrow(journal_df)
+journal_df <- journal_df[!missing_issn_mask,]
+logf(
+  "Sanitized %s journals -> %s valid journals; deleted %s journals (missing 'ISSN'); %s candidates for inference",
+  n_journals,
+  nrow(journal_df),
+  nrow(missing_issn_df),
+  nrow(issn_inference_candidate_df)
+)
+
 # check to see if any articles are missing journals
 missing_journal_mask <- !(article_df$journal_id %in% journal_df$journal_id)
 pmids_missing_journal <- unique(article_df[missing_journal_mask, 'pmid'])
@@ -662,8 +701,8 @@ logf(
 # cleanup any orphaned or redundant article_author records
 n_article_authors <- nrow(article_author_df)
 redundant_mask <- duplicated(article_author_df[, c("pmid", "author_id")])
-missing_author_mask <- !(!is.na(article_author_df$author_id) & article_author_df$author_id %in% author_df$author_id)
-missing_article_mask <- !(!is.na(article_author_df$pmid) & article_author_df$pmid %in% article_df$pmid)
+missing_author_mask <- is.na(article_author_df$author_id) | !(article_author_df$author_id %in% author_df$author_id)
+missing_article_mask <- is.na(article_author_df$pmid) | !(article_author_df$pmid %in% article_df$pmid)
 valid_mask <- !redundant_mask & !missing_article_mask
 article_author_df <- article_author_df[valid_mask,]
 logf(
@@ -671,13 +710,17 @@ logf(
     'Sanitized %s article authors -> %s valid article authors; ',
     'deleted %s records:\n\t',
     '%s redundant authors\n\t',
-    '%s missing articles'
+    '%s missing articles\n\t',
+    '%s missing authors\n\t',
+    '%s missing both'
   ),
   n_article_authors,
   nrow(article_author_df),
   n_article_authors - nrow(article_author_df),
   sum(redundant_mask),
-  sum(missing_article_mask)
+  sum(missing_article_mask),
+  sum(missing_author_mask),
+  sum(missing_article_mask & missing_author_mask)
 )
 
 # --- Write data frames to SQLite
