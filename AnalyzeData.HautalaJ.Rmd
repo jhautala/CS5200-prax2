@@ -140,7 +140,7 @@ olap_dbcon <- dbConnect(
 For the purposes of this practicum, the OLTP database is intended to be a faithful representation of our upstream data, with just a few assumptions:
 
 * Each article must have a unique 'PMID': All articles have "PMID" in our XML data; none are excluded on this basis.
-* Each journal must have a unique 'ISSN': There are 563 journals missing "ISSN" in our XML data; they are excluded from ingestion. We were also unable to link an additional 563 journals.
+* Each journal must have a unique 'ISSN': There are 563 journals missing "ISSN" in our XML data; they are excluded from ingestion.
 * Each article must be linked to exactly one journal: There are 563 articles linked to journals that are missing "ISSN"; they are excluded during OLTP ingestion.
 * Each article can be linked to zero or more authors: All valid articles in the XML have authors.
 * Each author is distinct by a combination of `last_name`, `first_name`, `initials`, `suffix`, `collective_name`, and `affiliation`. During OLTP ingestion we drop 16 duplicate authors; it is impossible to distinguish them by any of their attributes or elements, so they are regarded as redundant. NOTE: We also drop 1288 article-author links, due to missing articles (which in turn are due to missing journals, as described above).
