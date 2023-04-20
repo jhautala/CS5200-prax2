@@ -21,13 +21,23 @@ CREATE TABLE dim.pub_date(
     imputed_month BOOLEAN,
     imputed_day BOOLEAN,
     imputed_season BOOLEAN,
+    month_from_year BOOLEAN,
+    month_from_season BOOLEAN,
+    day_from_year BOOLEAN,
+    day_from_month BOOLEAN,
+    day_from_season BOOLEAN,
     UNIQUE (
         pub_date,
         pub_season,
         imputed_year,
         imputed_month,
         imputed_day,
-        imputed_season
+        imputed_season,
+        month_from_year,
+        month_from_season,
+        day_from_year,
+        day_from_month,
+        day_from_season
     )
 );
 

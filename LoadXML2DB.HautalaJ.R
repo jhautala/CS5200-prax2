@@ -338,7 +338,7 @@ setMethod(
       }
     }
     
-    return(paste(elems, collapse = "/"))
+    return(paste(elems, collapse = '\x1F'))
   }
 )
 

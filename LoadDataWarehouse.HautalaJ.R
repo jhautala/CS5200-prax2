@@ -2,6 +2,9 @@
 #       the OLAP DB, it is not suitable for deployment where the OLAP DB needs to be
 #       "long-lived" (i.e. iteratively appended to over time).
 
+# IMPORTANT: Due to inequality of NULL in SQL, the intended unique constraint for
+#   `dim.author` is not fully enforced at the database level.
+
 # Acknowledgments: I used GPT-4 extensively during development of this script, primarily
 #   as a way to sift through the R documentation and discover language/library features.
 #   It proved indispensable for parsing stacktraces (or "tracebacks") and learning more
@@ -244,7 +247,8 @@ insert_dim <- function(
   col_names <- colnames(dim_df)
   for (i in 1:nrow(dim_df)) {
     row_data <- dim_df[i, ]
-    row_key <- paste(row_data[, natural_key_colnames], collapse='\x1F')
+    natural_key <- row_data[, natural_key_colnames]
+    row_key <- paste(ifelse(is.na(natural_key), "\x1F", as.character(natural_key)), collapse='\x1E')
     if (exists(row_key, extant_rows)) {
       new_rows[i] <- FALSE
       row_ids[i] <- extant_rows[[row_key]]
@@ -252,16 +256,34 @@ insert_dim <- function(
     }
     
     # check for extant dim row
-    select_query <- paste0(
-      sprintf("SELECT %s FROM %s WHERE ", surrogate_key_colname, table_name),
-      paste(paste0(natural_key_colnames, "=?"), collapse = " AND "),
-      ";"
+    key_filter <- list()
+    params <- list()
+    for (col in natural_key_colnames) {
+      if (is.na(row_data[, col])) {
+        key_filter[[length(key_filter) + 1]] <- paste(col, 'IS NULL')
+      } else {
+        key_filter[[length(key_filter) + 1]] <- paste0(col, '=?')
+        params[[length(params) + 1]] <- row_data[, col]
+      }
+    }
+    select_query <- sprintf(
+      "SELECT %s FROM %s WHERE %s;",
+      surrogate_key_colname,
+      table_name,
+      paste(key_filter, collapse = " AND ")
     )
-    params <- unname(as.list(dim_df[i, natural_key_colnames]))
-    select_extant_statement <- dbSendQuery(dbcon, select_query)
-    dbBind(select_extant_statement, params)
-    extant_id <- dbFetch(select_extant_statement)
-    dbClearResult(select_extant_statement)
+    if (length(params)) {
+      select_extant_statement <- dbSendQuery(dbcon, select_query)
+      dbBind(select_extant_statement, params)
+      extant_id <- dbFetch(select_extant_statement)
+      dbClearResult(select_extant_statement)
+    } else {
+      # skip rows with all null
+      new_rows[[i]] <- FALSE # not a new row
+      row_ids[[i]] <- NA_integer_ # null pointer for foreign key
+      extant_rows[[row_key]] <- row_ids[i] # skip subsequent occurrences
+      next
+    }
     
     # insert as needed
     if (nrow(extant_id) > 0) {
@@ -309,7 +331,12 @@ insert_batch = function(results_df) {
         'imputed_year',
         'imputed_month',
         'imputed_day',
-        'imputed_season'
+        'imputed_season',
+        'month_from_year',
+        'month_from_season',
+        'day_from_year',
+        'day_from_month',
+        'day_from_season'
       )])
       list[pub_date_dim_id, new_pub_dates] <- insert_dim(
         olap_dbcon,
@@ -321,7 +348,12 @@ insert_batch = function(results_df) {
           'imputed_year',
           'imputed_month',
           'imputed_day',
-          'imputed_season'
+          'imputed_season',
+          'month_from_year',
+          'month_from_season',
+          'day_from_year',
+          'day_from_month',
+          'day_from_season'
         ),
         pub_date_dim_df
       )
@@ -384,6 +416,7 @@ insert_batch = function(results_df) {
         'collective_name',
         'affiliation'
       )])
+      
       list[author_dim_id, new_authors] <- insert_dim(
         olap_dbcon,
         'dim.author',
@@ -479,6 +512,8 @@ sql_query <- (
 result <- dbSendQuery(oltp_dbcon, sql_query)
 new_row_counts <- list()
 batch_i <- 1
+got_error <- FALSE
+all_ymds_counts <- NULL
 while (!dbHasCompleted(result)) {
   results_df <- dbFetch(result, n=batch_size)
   if (nrow(results_df) == 0) {
@@ -491,7 +526,13 @@ while (!dbHasCompleted(result)) {
   results_df$imputed_month <- FALSE
   results_df$imputed_day <- FALSE
   results_df$imputed_season <- FALSE
+  results_df$month_from_year <- FALSE
+  results_df$month_from_season <- FALSE
+  results_df$day_from_year <- FALSE
+  results_df$day_from_month <- FALSE
+  results_df$day_from_season <- FALSE
   
+  # --- extract MedlineDate first
   # create YMDS masks
   has_year <- !(is.na(results_df$pub_year))
   has_month <- !(is.na(results_df$pub_month))
@@ -503,7 +544,7 @@ while (!dbHasCompleted(result)) {
   #       This function makes its own...
   ymds_counts <- count_ymds(results_df)
   
-  # get what we can from medline_date
+  # --- get what we can from medline_date
   ymds <- extract_ymds(results_df$medline_date)
   
   # copy those into the results data frame if NA
@@ -551,7 +592,29 @@ while (!dbHasCompleted(result)) {
     logf('Encountered Season with Month: %s', tmp)
   }
   
-  # check for opportunities to infer dates from Season and Year
+  # --- check for opportunities to infer day from Month
+  tmp <- sum(has_month & !has_day)
+  if (tmp) {
+    logf('Encountered %s opportunities to infer Day from Month', tmp)
+  }
+  results_df <- results_df %>%
+    mutate(
+      pub_day = ifelse(!is.na(pub_month) & is.na(pub_day), 1, pub_day)
+    )
+  ymds_counts <- rbind(ymds_counts, day_from_month=count_ymds(results_df))
+  
+  # record inferred values
+  day_from_month_mask <- (!has_day & !is.na(results_df$pub_day))
+  results_df[day_from_month_mask, 'day_from_month'] <- TRUE
+  results_df[day_from_month_mask, 'imputed_day'] <- TRUE
+  
+  # reset YMDS masks
+  has_year <- !(is.na(results_df$pub_year))
+  has_month <- !(is.na(results_df$pub_month))
+  has_day <- !(is.na(results_df$pub_day))
+  has_season <- !(is.na(results_df$pub_season))
+  
+  # --- check for opportunities to infer day/month from Season
   tmp <- sum(has_season & (!has_month | !has_day))
   if (tmp) {
     logf('Encountered %s opportunities to infer Month/Day from Season.', tmp)
@@ -562,42 +625,52 @@ while (!dbHasCompleted(result)) {
       pub_month = ifelse(is.na(pub_month), md[, 1], pub_month),
       pub_day = ifelse(is.na(pub_day), md[, 2], pub_day)
     )
-  
   ymds_counts <- rbind(ymds_counts, season_start=count_ymds(results_df))
   
   # record inferred values
-  results_df[(!has_month & !is.na(results_df$pub_month)), 'imputed_month'] <- TRUE
-  results_df[(!has_day & !is.na(results_df$pub_day)), 'imputed_day'] <- TRUE
+  month_from_season_mask <- (!has_month & !is.na(results_df$pub_month))
+  day_from_season_mask <- (!has_day & !is.na(results_df$pub_day))
+  results_df[month_from_season_mask, 'imputed_month'] <- TRUE
+  results_df[month_from_season_mask, 'month_from_season'] <- TRUE
+  results_df[day_from_season_mask, 'day_from_season'] <- TRUE
+  results_df[day_from_season_mask, 'imputed_day'] <- TRUE
   
-  # reset counts
+  # reset YMDS masks
   has_year <- !(is.na(results_df$pub_year))
   has_month <- !(is.na(results_df$pub_month))
   has_day <- !(is.na(results_df$pub_day))
   has_season <- !(is.na(results_df$pub_season))
   
+  # --- check for opportunities to infer day/month from Year
   tmp <- sum(has_year & (!has_month & !has_day))
   if (tmp) {
     logf('Encountered %s opportunities to infer Month/Day from Year', tmp)
   }
   results_df <- results_df %>%
     mutate(
-      pub_month = ifelse(is.na(pub_month), 1, pub_month),
-      pub_day = ifelse(is.na(pub_day), 1, pub_day)
+      pub_month = ifelse(!is.na(pub_year) & is.na(pub_month), 1, pub_month),
+      pub_day = ifelse(!is.na(pub_month) & is.na(pub_day), 1, pub_day)
     )
   ymds_counts <- rbind(ymds_counts, year_start=count_ymds(results_df))
   
   # record inferred values
-  results_df[(!has_month & !is.na(results_df$pub_month)), 'imputed_month'] <- TRUE
-  results_df[(!has_day & !is.na(results_df$pub_day)), 'imputed_day'] <- TRUE
+  month_from_year_mask <- (!has_month & !is.na(results_df$pub_month))
+  day_from_year_mask <- (!has_day & !is.na(results_df$pub_day))
+  results_df[month_from_year_mask, 'month_from_year'] <- TRUE
+  results_df[month_from_year_mask, 'imputed_month'] <- TRUE
+  results_df[day_from_year_mask, 'day_from_year'] <- TRUE
+  results_df[day_from_year_mask, 'imputed_day'] <- TRUE
   
-  logf('Inferred YMDS:')
-  print(ymds_counts)
-  # ymds_counts:
-  #                  pub_year pub_month pub_day pub_season
-  #   initial_counts 68768    55078     18863   148       
-  #   parse_medline  75775    62059     19116   151       
-  #   season_start   75775    62210     19267   151       
-  #   year_start     75775    75775     75775   151       
+  ymds_counts <- as.data.frame(ymds_counts)
+  ymds_counts$batch <- batch_i
+  ymds_counts$step <- factor(row.names(ymds_counts), levels=row.names(ymds_counts), ordered=TRUE)
+  row.names(ymds_counts) <- NULL
+  ymds_counts <- ymds_counts[, c('batch', 'step', 'pub_year', 'pub_month', 'pub_day', 'pub_season')]
+  if (is.null(all_ymds_counts)) {
+    all_ymds_counts <- ymds_counts
+  } else {
+    all_ymds_counts <- rbind(all_ymds_counts, ymds_counts)
+  }
   
   # fill in the date as well as we can with YMD
   results_df$pub_date <- NA
@@ -622,6 +695,10 @@ while (!dbHasCompleted(result)) {
   
   # insert batch into OLAP DB
   curr_row_counts <- insert_batch(results_df)
+  if (is.null(curr_row_counts)) {
+    got_error <- TRUE
+    break
+  }
   new_row_counts[[paste('batch ', batch_i)]] <- list(curr_row_counts)
   batch_i <- batch_i + 1
 }
@@ -629,7 +706,20 @@ while (!dbHasCompleted(result)) {
 # close the result set
 dbClearResult(result)
 
-logf('Finished ingestion!')
+logf(if (got_error) 'Ingestion Failed!' else 'Finished ingestion!')
+
+# Inferred YMDS:
+#                pub_year pub_month pub_day pub_season
+# initial_counts 68818    55123     18881   148       
+# parse_medline  75826    62105     19134   151       
+# season_start   75826    62256     19285   151       
+# year_start     75826    75826     75826   151       
+all_ymds_counts$pub_year <- sapply(all_ymds_counts$pub_year, as.numeric)
+all_ymds_counts$pub_month <- sapply(all_ymds_counts$pub_month, as.numeric)
+all_ymds_counts$pub_day <- sapply(all_ymds_counts$pub_day, as.numeric)
+all_ymds_counts$pub_season <- sapply(all_ymds_counts$pub_season, as.numeric)
+print(aggregate(. ~ step, data = all_ymds_counts, FUN = sum, na.rm = TRUE))
+
 counts_df <- do.call(rbind, lapply(new_row_counts, as.data.frame))
 print(counts_df)
 
