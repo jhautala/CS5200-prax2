@@ -593,6 +593,8 @@ while (!dbHasCompleted(result)) {
   }
   
   # --- check for opportunities to infer day from Month
+  # NOTE: We do this first (after medline date) so we can keep track of
+  #       where each field was logically imputed from.
   tmp <- sum(has_month & !has_day)
   if (tmp) {
     logf('Encountered %s opportunities to infer Day from Month', tmp)
@@ -718,7 +720,8 @@ all_ymds_counts$pub_year <- sapply(all_ymds_counts$pub_year, as.numeric)
 all_ymds_counts$pub_month <- sapply(all_ymds_counts$pub_month, as.numeric)
 all_ymds_counts$pub_day <- sapply(all_ymds_counts$pub_day, as.numeric)
 all_ymds_counts$pub_season <- sapply(all_ymds_counts$pub_season, as.numeric)
-print(aggregate(. ~ step, data = all_ymds_counts, FUN = sum, na.rm = TRUE))
+agg_ymds_count <- aggregate(. ~ step, data = all_ymds_counts, FUN = sum, na.rm = TRUE)
+print(agg_ymds_count[, -which(names(agg_ymds_count) %in% c('batch'))])
 
 counts_df <- do.call(rbind, lapply(new_row_counts, as.data.frame))
 print(counts_df)
