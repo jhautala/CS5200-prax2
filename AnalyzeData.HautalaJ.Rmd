@@ -6,6 +6,9 @@ output:
   pdf_document:
     fig_caption: yes
     toc: yes
+header-includes:
+   - \usepackage{caption}
+   - \captionsetup{labelfont=bf}
 ---
 
 \newpage
@@ -24,12 +27,12 @@ deps <- c(
   'RMariaDB',
   'stringr',
   'lubridate',
-  'ggplot2',
-  'qcc',
   'dplyr',
-  'Hmisc',
-  'tidyr',
-  'pracma',
+  'ggplot2',
+  # 'qcc',
+  # 'Hmisc',
+  # 'tidyr',
+  # 'pracma',
   'scales',
   'gridExtra'
 )
@@ -43,12 +46,12 @@ library(DBI)
 library(RMariaDB)
 library(stringr)
 library(lubridate)
-library(ggplot2)
-library(qcc)
 library(dplyr)
-library(Hmisc)
-library(tidyr)
-library(pracma)
+library(ggplot2)
+# library(qcc)
+# library(Hmisc)
+# library(tidyr)
+# library(pracma)
 library(scales)
 library(gridExtra)
 
@@ -67,12 +70,8 @@ NOTE: This notebook was developed using:
 * RMariaDB: 1.2.2
 * stringr: 1.5.0
 * lubridate: 1.9.2
-* ggplot2: 3.4.2
-* qcc: 2.7
 * dplyr: 1.1.1
-* Hmisc: 5.0.1
-* tidyr: 1.3.0
-* pracma: 2.4.2
+* ggplot2: 3.4.2
 * scales: 1.2.1
 * gridExtra: 2.3
 
@@ -143,20 +142,25 @@ For the purposes of this practicum, the OLTP database is intended to be a faithf
 * Each article must have a unique 'PMID': All articles have "PMID" in our XML data; none are excluded on this basis.
 * Each journal must have a unique 'ISSN': There are 563 journals missing "ISSN" in our XML data; they are excluded from ingestion. We were also unable to link an additional 563 journals.
 * Each article must be linked to exactly one journal: There are 563 articles linked to journals that are missing "ISSN"; they are excluded during OLTP ingestion.
-* Each article can be linked to zero or more authors: There are no articles missing authors in the data set.
+* Each article can be linked to zero or more authors: All valid articles in the XML have authors.
 * Each author is distinct by a combination of `last_name`, `first_name`, `initials`, `suffix`, `collective_name`, and `affiliation`. During OLTP ingestion we drop 16 duplicate authors; it is impossible to distinguish them by any of their attributes or elements, so they are regarded as redundant. NOTE: We also drop 1288 article-author links, due to missing articles (which in turn are due to missing journals, as described above).
 
 ## OLAP Ingestion
 During OLAP ingestion the journal and author entities remain largely unchanged, but we make some inferences around publication dates:
 
 * We assume the `season` field is constrained to one of four options: 'Spring', 'Summer', 'Winter', 'Fall'.
-* In order to arrive at a "best guess" for publication date, we assume that the actual publication date is the start of the period indicated. For example, an article record with only `year=1978` and `month=6` in the OLTP DB is imputed to have a publication date of the first of the month (`pub_date='1978-06-01'`). This may cause bias toward publications being attributed to period start dates, but we keep track of the cases where we make these assumptions in dedicated fields on the `dim.pub_date` dimension table.
-* Where we find time ranges in the `medline_date` field, we assume the actual publication date is the start of the period. For example, a `medline_date` value of '1978 Fall-Winter' is imputed to mean `year=1978 ^ month=Fall`. By this method, we find ourselve imputing values for publication year, e.g.: $medline\_date=\text{'1978-1979 Winter'} \implies pub\_year=1978 \land pub\_season=\text{'Winter'}$. Where we made this sort of inference, we set Boolean flags on the `dim.pub_date` table (e.g.: `imputed_year`, `imputed_month`, `imputed_day`, and `imputed_season`) to essentially defer this decision (i.e. query authors can decide whether they want to ignore imputed date fields).
+* Where we find time ranges in the `medline_date` field, we infer the publication date is the start of the range For example: $medline\_date=\text{'1978 Fall-Winter'} \rightarrow pub\_year=1978 \land pub\_season=\text{'Fall'}$. By this method, we find ourselves imputing values for publication year, e.g.: $medline\_date=\text{'1978-1979 Winter'} \rightarrow pub\_year=1978 \land pub\_season=\text{'Winter'}$.
+* In order to produce a "best guess" for publication date, we assume the publication date is the start of the period. For example, an article with only year and month in the OLTP DB has an inferred publication date of the first of the month ($pub\_year=1978 \land pub\_month=6 \rightarrow pub\_date=\text{'1978-06-01'}$). This may cause bias toward publications being attributed to period start dates, but we keep track of the cases where we make these assumptions in dedicated fields on the `dim.pub_date` dimension table.
 * When imputing publication date from `season`, we assume the meteorological convention for season start dates:
   * Spring: March 1
   * Summer: June 1
   * Fall: September 1
   * Winter: December 1
+
+## Keeping track of imputed values
+In order to support more granular filtering on imputed date values we set Boolean flags on the `dim.pub_date` table: `imputed_year`, `imputed_month`, `imputed_day`, and `imputed_season`. We also store flags to indicate the degree of inference: `month_from_year`, `month_from_season`, `day_from_year`, `day_from_month`, and `day_from_season` indicate the specific source of imputed months and days. This deferred analysis adds a fair amount of complexity that may not be desirable in production, but is useful for early iterations, to show users what is possible and allow stakeholders to evaluate the consequences of assumptions we might make during OLAP ingestion.
+
+Publication dates that have a flag for an imputed field (e.g. `imputed_month`) with no additional flags (i.e. $month\_from\_year=FALSE \land month\_from\_season=FALSE$) were imputed from `medline_date`, either as a single value (e.g. $medline\_date=\text{'1978 Apr 5-25'} \rightarrow pub\_month=4$), or as a range (e.g. $medline\_date=\text{'1978 Apr-May'} \rightarrow pub\_month=4$).
 
 \newpage
 # Analytical Queries
@@ -204,7 +208,7 @@ kable(top5_journals, caption=sprintf(
 
 \newpage
 ### Plot the results
-```{r top5_journals_pareto, fig.cap="Top 5 Journals Pareto"}
+```{r top5_journals_pareto, fig.cap="Example Top 5 Journals Pareto"}
 # prepare titles for wrapping
 top5_journals$title_wrapped <- str_wrap(top5_journals$journal_title, 24)
 
@@ -223,14 +227,18 @@ top5_journals_pareto <- ggplot(top5_journals, aes(x=title_wrapped, y=article_cou
   ylab('Articles Published') +
   labs(fill='Articles\nPublished') +
   geom_col(aes(fill=article_count), width=0.8) +
-  ggtitle(sprintf('Top 5 Journals for %s weeks as of %s', n_weeks, asof_date)) +
+  ggtitle(sprintf(
+    'Top 5 Journals Pareto - %s weeks as of %s',
+    n_weeks,
+    format(asof_date, "%B %d, %Y")
+  )) +
   coord_flip() +
   theme_minimal() +
   theme(
-    plot.title = element_text(hjust=0.5),
-    axis.title.y = element_text(margin=margin(t=0, r=10, b=0, l=0)),
-    axis.title.x = element_text(margin=margin(t=10, r=0, b=0, l=0)),
-    legend.title = element_text(margin=margin(t=0, r=0, b=10, l=0))
+    plot.title=element_text(hjust=0.5),
+    axis.title.y=element_text(margin=margin(t=0, r=10, b=0, l=0)),
+    axis.title.x=element_text(margin=margin(t=10, r=0, b=0, l=0)),
+    legend.title=element_text(margin=margin(t=0, r=0, b=10, l=0))
   )
 top5_journals_pareto
 ```
@@ -289,7 +297,10 @@ get_yq_grid_df <- function(min_pub_date=NA, max_pub_date=NA) {
 \newpage
 ### Generate SQL queries for `ROLLUP` aggregation
 ```{r rollupSql}
-get_rollup <- function(exclude_month_from_year=FALSE) {
+get_rollup <- function(
+    exclude_month_from_year=FALSE,
+    exclude_month_from_season=FALSE
+) {
   sql <- paste0(
   "
     WITH quarterly AS(
@@ -304,6 +315,8 @@ get_rollup <- function(exclude_month_from_year=FALSE) {
               AND aa.journal_dim_id = j.journal_dim_id",
   if (exclude_month_from_year) ("
               AND pd.month_from_year = FALSE") else "",
+  if (exclude_month_from_season) ("
+              AND pd.month_from_season = FALSE") else "",
   "
          GROUP BY j.journal_dim_id, `year`, `quarter` WITH ROLLUP
     )
@@ -323,6 +336,7 @@ get_rollup <- function(exclude_month_from_year=FALSE) {
 
 \newpage
 ### Perform the requested aggregation
+We present a sample of the requested data. A comprehensive tabular view of the data is not appropriate for a regular report to management; perhaps they are interested in a sort of Pareto list of high article counts.
 ```{r rollupData}
 journal_rollup <- get_rollup()
 requested_aggregation <- journal_rollup[!is.na(journal_rollup$year),]
@@ -330,8 +344,42 @@ top10 <- head(
   requested_aggregation[order(requested_aggregation$count, decreasing=TRUE),],
   n=10
 )
-kable(top10,
+kable(top10[, -which(names(top10) %in% c("journal_dim_id"))],
+  row.names=FALSE,
   caption='\\label{tab:top10}Top 10 Article Counts per Journal (mixed agg via `ROLLUP`)'
+)
+```
+
+\newpage
+### Compare without clipping month to period start
+Table \ref{tab:top10} shows that every article published by `journal_dim_id` 49 in 1976 was published in the first quarter of 1976. This could be caused by the "period start bias" mentioned in the Data Pipeline section (e.g. perhaps that journal only reported the `pub_year` for all of those articles). To test this we can exclude those publications that were missing month until we imputed it as the start of the year or season.
+
+NOTE: Excluding publication dates that were missing `pub_month` until we inferred it from `pub_year` or `pub_season` will exclude a fair number of articles. The decision of how/whether to include such data in OLAP queries is deferred to the query author.
+
+```{r excludeImputed}
+journal_rollup_sans_mfy <- get_rollup(
+  exclude_month_from_year=TRUE,
+  exclude_month_from_season=FALSE
+)
+incl_clipped <- requested_aggregation[
+  (!is.na(requested_aggregation$quarter) & requested_aggregation$journal_dim_id==49),
+]
+incl_clipped$include_clipped_month <- TRUE
+excl_clipped <- journal_rollup_sans_mfy[
+  (!is.na(journal_rollup_sans_mfy$quarter) & journal_rollup_sans_mfy$journal_dim_id==49),
+  ]
+excl_clipped$include_clipped_month <- FALSE
+single_journal_df <- rbind(
+  incl_clipped,
+  excl_clipped
+)[, c('year', 'quarter', 'count', 'include_clipped_month')]
+kable(
+  single_journal_df[with(single_journal_df, order(year, quarter)),],
+  row.names=FALSE,
+  caption=sprintf(
+    '\\label{tab:clipped_month}Article Counts with/without clipped month (journal_dim_id=%s)',
+    incl_clipped[1,'journal_dim_id']
+  )
 )
 ```
 
@@ -342,7 +390,11 @@ kable(top10,
 quarterly_df <- journal_rollup[!is.na(journal_rollup$quarter),]
 
 # prepare the data for visualization
-quarterly_df$year_quarter <- paste(quarterly_df$year, quarterly_df$quarter, sep = " Q")
+quarterly_df$year_quarter <- paste(
+  quarterly_df$year,
+  quarterly_df$quarter,
+  sep=" Q"
+)
 quarterly_df$year_quarter <- factor(
   quarterly_df$year_quarter,
   levels=sort(unique(quarterly_df$year_quarter)),
@@ -352,25 +404,20 @@ quarterly_df$count <- as.integer(quarterly_df$count)
 ```
 
 ### A Boxplot per Quarter
-```{r boxplot, fig.cap="Box Plot per Quarter"}
+```{r boxplot, eval=FALSE}
 qy_df <- get_yq_grid_df()
-quarterly_boxplot <- function(df, notch=FALSE, outlier.alpha=1, desc='Box Plot - Article Counts per Journal') {
-  ggplot(df, aes(x = year_quarter, y = count)) +
+quarterly_boxplot <- function(
+    df,
+    notch=FALSE,
+    outlier.alpha=1,
+    desc='Box Plot Trend - Article Counts per Journal'
+) {
+  ggplot(df, aes(x=year_quarter, y=count)) +
     stat_boxplot(geom='errorbar') +
-    geom_boxplot(
-      notch=notch,
-      outlier.shape=16,
-      outlier.alpha=outlier.alpha
-    ) +
-    labs(
-      title = desc,
-      x = "Year and Quarter",
-      y = "Article Count"
-    ) +
+    geom_boxplot(notch=notch, outlier.shape=16, outlier.alpha=outlier.alpha) +
     scale_x_discrete(
       breaks=qy_df$year_quarter,
       labels = function(x) {
-        # TODO: use str_split instead?
         year_labels <- gsub(" .*", "", x)
         quarter_labels <- gsub("^[^ ]+ ", "", x)
         return(ifelse(quarter_labels == "Q1",
@@ -379,160 +426,200 @@ quarterly_boxplot <- function(df, notch=FALSE, outlier.alpha=1, desc='Box Plot -
         ))
       }) +
     scale_y_continuous(
-      # trans='log2',
       trans=pseudo_log_trans(),
       breaks=c(0, 1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100, 200)
     ) +
+    labs(title=desc, x="Year and Quarter", y="Article Count") +
     theme_minimal() +
     theme(
       plot.title=element_text(hjust=0.5, margin=margin(t=0, r=0, b=10, l=0)),
-      axis.title.x = element_text(margin=margin(t=10, r=0, b=0, l=0)),
-      axis.title.y = element_text(margin=margin(t=0, r=10, b=0, l=0))
+      axis.title.x=element_text(margin=margin(t=10, r=0, b=0, l=0)),
+      axis.title.y=element_text(margin=margin(t=0, r=10, b=0, l=0))
     )
 }
 quarterly_boxplot(quarterly_df, outlier.alpha=0.25)
 ```
 
-This plot shows that the vast majority of journals publish just a few articles per quarter. If the data includes at least two distinct populations, we can use k-means to separate out more coherent populations.
+\newpage
+```{r boxplot, fig.cap="\\label{fig:boxplot}Example Box Plot Trend of Article Counts per Quarter", echo=FALSE}
+```
 
-```{r topCluster, fig.cap="Box Plot for High Volume Journals"}
+Figure \ref{fig:boxplot} shows that the vast majority of journals publish just a few articles per quarter, but there seem to be a lot of outliers. If the data includes at least two distinct populations, we can use k-means to split our data into more coherent populations and create separate distribution plots. We tried this for `k=2` and the distributions for lower volume journals still had a lot of outliers, but the plot for higher volume journals produced a fairly comprehensible boxplot (Figure \ref{fig:topCluster}).
+
+\newpage
+### Boxplot for "Cluster A" (high volume journals)
+```{r topCluster, fig.cap="\\label{fig:topCluster}Example Box Plot Trend for High Volume Journals"}
 journal_stats <- quarterly_df %>%
-  group_by(journal_title) %>%
-  dplyr::summarize(total_count = sum(count))
+  group_by(journal_dim_id) %>%
+  dplyr::summarize(total_count=sum(count))
 
-# k-means clustering
+# perform k-means clustering
 set.seed(42)
 clusters <- kmeans(journal_stats$total_count, centers=2)
 journal_stats$cluster <- factor(clusters$cluster)
-clustered_df <- merge(quarterly_df, journal_stats %>% select(journal_title, cluster), by = "journal_title")
+clustered_df <- merge(
+  quarterly_df,
+  journal_stats %>% select(journal_dim_id, cluster), by="journal_dim_id"
+)
 
-# split per cluster
+# assign clusters to our data
 quarterly_df_split <- split(clustered_df, clustered_df$cluster)
 
 # plot the highest cluster
 high_volume_journals_df <- quarterly_df_split[[which.max(clusters$centers)]]
 quarterly_boxplot(
   high_volume_journals_df,
-  desc=sprintf('Top %s High Volume Journals', nrow(high_volume_journals_df)),
+  desc=sprintf('Box Plot Trend - Top %s High Volume Journals', nrow(high_volume_journals_df)),
   # notch=TRUE,
   outlier.alpha=0.25
 )
 ```
 
+\newpage
+### Experimental density-based visualization
+This concept behind this visualization is to generate KDE curves per quarter and then draw vertical gradients to indicate the distributions of journals per article count per quarter. The main parameters to adjust are the bandwidth and kernel of the KDE curves.
+```{r kdeCalc}
+yq_grid_df <- get_yq_grid_df()
+df <- quarterly_df
+n_journals <- length(unique(df$journal_dim_id))
 
-```{r}
-# yq_grid_df <- get_yq_grid_df()
-# n_journals <- length(unique(quarterly_df$journal_title))
-# 
-# kdes <- list()
-# for (yq in quarterly_df$year_quarter) {
-#   # only using non-zero counts
-#   # counts <- quarterly_df[quarterly_df$year_quarter == yq, 'count']
-#   # if (length(counts) == 0) {
-#   #   counts <- c(0, 0)
-#   # } else if (length(counts) == 1) {
-#   #   counts <- c(counts[[1]], counts[[1]])
-#   # }
-#   # kdes[[yq]] <- density(counts)
-#   
-#   # NOTE: including all zeroes makes the lowest values way too strong
-#   counts <- quarterly_df[quarterly_df$year_quarter == yq, 'count']
-#   zeroes <- rep(0, n_journals - length(counts))
-#   kdes[[yq]] <- density(c(counts, zeroes))
-# }
-# 
-# kde_data <- lapply(names(kdes), function(yq) {
-#   kde <- kdes[[yq]]
-#   data.frame(x = yq, y = kde$x, strength = kde$y)
-# }) %>%
-#   bind_rows()
-# 
-# # scale the 'strength'
-# strength_scale <- function(x, p = .2, to = c(0, 1), from = range(x, na.rm = TRUE)) {
-#   # (log1p(x) - log1p(from[1])) / (log1p(from[2]) - log1p(from[1])) * (to[2] - to[1]) + to[1]
-#   (log1p(x^p) - log1p(from[1]^p)) / (log1p(from[2]^p) - log1p(from[1]^p)) * (to[2] - to[1]) + to[1]
-#   # log1p(x^p) / (log1p(from[2]^p) - log1p(from[1]^p)) * (to[2] - to[1]) + to[1]
-# }
-# ggplot(kde_data, aes(x = x, y = y, fill = strength)) +
-#   geom_tile(aes(height = 0.9, width = 0.9)) +
-#   scale_fill_gradient('Number of Journals', low='white', high='steelblue', rescaler=strength_scale) +
-#   scale_x_discrete(labels = function(x) {
-#     # TODO: use str_split instead?
-#     year_labels <- gsub(" .*", "", x)
-#     quarter_labels <- gsub("^[^ ]+ ", "", x)
-#     return(ifelse(
-#       quarter_labels == "Q1",
-#       str_wrap(paste(quarter_labels, year_labels), 4),
-#       quarter_labels
-#     ))
-#   }) +
-#   theme_minimal() +
-#   theme(axis.text.y = element_text(angle = 0)) +
-#   labs(x = "Year and Quarter", y = "Article Counts")
+kdes <- list()
+for (yq in yq_grid_df$year_quarter) {
+  # only using non-zero counts
+  counts <- df[df$year_quarter == yq, 'count']
+  if (length(counts) == 0) {
+    counts <- c(0, 0)
+  } else if (length(counts) == 1) {
+    # TODO: come up with another way to handle single values?
+    #       this is kind of a hack...
+    counts <- c(counts[[1]], counts[[1]])
+  }
+  kdes[[yq]] <- density(
+    counts,
+    bw=0.05,
+    # kernel="rectangular"
+    kernel="epanechnikov"
+  )
+
+  # NOTE: this solution excludes 
+  # counts <- df[df$year_quarter == yq, 'count']
+  # zeroes <- rep(0, n_journals - length(counts))
+  # kdes[[yq]] <- density(c(counts, zeroes))
+}
+
+kde_data <- lapply(names(kdes), function(yq) {
+  kde <- kdes[[yq]]
+  data.frame(x=yq, y=kde$x, strength=kde$y)
+}) %>%
+  bind_rows()
+
+# scale the 'strength' (i.e. estimated journal density per KDE)
+strength_scale <- function(x, p=0.3, to=c(0, 1), from=range(x, na.rm=TRUE)) {
+  to_range <- to[2] - to[1]
+  offset <- log1p(x^p) - log1p(from[1]^p)
+  from_range <- log1p(from[2]^p) - log1p(from[1]^p)
+  offset / from_range * to_range + to[1]
+}
 ```
 
+\newpage
+### Plot the experimental density trend
+See Figure \ref{fig:kdeTrend} for an example of this unusual plot.
 
-```{r}
-# NOTE: this is neat but x axis all messed up; also uniform bin count per quarter
-# NOTE: also, it is currently broken...
-# ggplot(data = quarterly_hist_complete_df, aes(x = reorder(year_quarter, year_quarter), y = bin, fill = count_journals)) +
-#   geom_bar(width = 0.9, height = 0.9) +
-#   scale_fill_gradient("Number of Journals", low = "white", high = "steelblue") +
-#   labs(
-#     title = sprintf("Histogram - %s", y),
-#     x = "Year and Quarter",
-#     y = "Article Counts"
-#   ) +
-#   scale_x_discrete(labels = function(x) {
-#     year_labels <- gsub(" .*", "", x)
-#     quarter_labels <- gsub("^[^ ]+ ", "", x)
-#     return(ifelse(
-#       quarter_labels == "Q1",
-#       str_wrap(paste(quarter_labels, year_labels), 4),
-#       quarter_labels
-#     ))
-#   }) +
-#   theme_minimal() +
-#   theme(
-#     plot.title = element_text(hjust = 0.5),
-#     axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 0)),
-#     axis.text.x = element_text(angle = 0, hjust = 0.5)
-#   )
+NOTE: This plot is not fit for any established purpose and difficult to interpret.
+```{r kdeTrend, fig.cap="\\label{fig:kdeTrend}Example KDE-based Quarterly Trend Plot"}
+# NOTE: we suppress warnings here to prevent ggplot2 from
+#       reporting values outside of the clipped range of y values.
+suppressWarnings(
+  print(
+    ggplot(kde_data, aes(x=x, y=y, fill=strength)) +
+      geom_tile(aes(height=0.9, width=0.75)) +
+      scale_fill_gradient(
+        'Journal\nCount',
+        low='white',
+        high='steelblue',
+        rescaler=strength_scale
+      ) +
+      scale_x_discrete(labels = function(x) {
+        # TODO: use str_split instead?
+        year_labels <- gsub(" .*", "", x)
+        quarter_labels <- gsub("^[^ ]+ ", "", x)
+        return(ifelse(
+          quarter_labels == "Q1",
+          str_wrap(paste(quarter_labels, year_labels), 4),
+          quarter_labels
+        ))
+      }) +
+      scale_y_continuous(
+        trans=pseudo_log_trans(),
+        breaks=c(0, 1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100, 200),
+        limits=c(0, max(df$count))
+      ) +
+      theme_minimal() +
+      theme(axis.text.y=element_text(angle=0)) +
+      labs(x="Year and Quarter", y="Article Counts")
+  )
+)
 ```
 
-
-```{r}
+\newpage
+### Yearly histograms (with stacked bars per quarter)
+```{r multipleHistograms, fig.cap="Example Yearly Histogram"}
 # create a placeholder data frame for missing year_quarter and bin combinations
 yq_grid_df <- get_yq_grid_df()
 
 plot_list <- list()
-all_journals <- unique(quarterly_df$journal_title)
-par(mfrow = c(length(unique(yq_grid_df$y)), 1))
+n_journals <- length(unique(quarterly_df$journal_dim_id))
+default_par <- par()[c('mfrow', 'mar', 'oma')]
+par(
+  mfrow=c(length(unique(yq_grid_df$y)), 1),
+  mar=c(20, 4, 4, 10),
+  oma=c(20, 4, 4, 10)
+)
 for (y in sort(unique(yq_grid_df$y))) {
   # Create a data frame to store histogram data
   hist_data <- data.frame()
   max_count <- max(quarterly_df[quarterly_df$year == y, 'count'])
-  breaks <- c(0, 1, logspace(log10(2), log10(max_count), 11))
+  # breaks <- c(0, 1, logspace(log10(2), log10(max_count), 11))
+  # breaks <- c(0, 1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100, 200, 300)
+  breaks <- c(0)
+  b <- 0
+  p <- 0
+  while (TRUE) {
+    if (b == 5) {
+      b <- 1
+      p <- p + 1
+    } else {
+      b <- b + 1
+    }
+    breaks <- append(breaks, b * 10**p)
+    if (b * 10**p > max_count) {
+      break
+    }
+  }
   for (q in sort(unique(yq_grid_df$q[yq_grid_df$y == y]))) {
-    subset_df <- quarterly_df[(quarterly_df$year == y & quarterly_df$quarter==q), c('quarter', 'count')]
-    # num_zeroes <- length(all_journals) - nrow(subset_df)
-    # with_zeroes <- c(subset_df$count, zeroes)
+    subset_df <- quarterly_df[
+      (quarterly_df$year == y & quarterly_df$quarter==q),
+      c('quarter', 'count')
+    ]
+    num_zeroes <- n_journals - nrow(subset_df)
+    with_zeroes <- c(subset_df$count, rep(0, num_zeroes))
     hname <- sprintf('Q%s', q)
     hd <- hist(
+      subset_df$count,
       # with_zeroes,
       # breaks="Sturges",
       breaks=breaks,
-      subset_df$count,
       # breaks=20,
       plot=FALSE
     )
 
     tmp_df <- data.frame(
-      year_quarter = rep(hname, length(hd$mids)),
-      left = hd$breaks[-length(hd$breaks)],
-      right = hd$breaks[2:length(hd$breaks)],
-      mids = hd$mids,
-      counts = hd$counts
+      year_quarter=rep(hname, length(hd$mids)),
+      left=hd$breaks[-length(hd$breaks)],
+      right=hd$breaks[2:length(hd$breaks)],
+      mids=hd$mids,
+      counts=hd$counts
     )
     hist_data <- rbind(hist_data, tmp_df)
   }
@@ -540,62 +627,52 @@ for (y in sort(unique(yq_grid_df$y))) {
   hist_data_cum <- hist_data %>%
     group_by(mids) %>%
     mutate(
-      bottom = cumsum(counts) - counts,
-      top = cumsum(counts)
+      bottom=cumsum(counts) - counts,
+      top=cumsum(counts)
     ) %>%
     ungroup()
-  p <- ggplot(hist_data_cum, aes(xmin = left, xmax = right, ymin = bottom, ymax = bottom + counts, fill = year_quarter)) +
+  print(ggplot(
+    hist_data_cum,
+    aes(
+      xmin=left,
+      xmax=right,
+      ymin=bottom,
+      ymax=bottom + counts,
+      fill=year_quarter
+    )
+  ) +
     geom_rect() +
-    scale_fill_brewer("Quarter", palette = "Set1") +
-    scale_x_continuous(trans=pseudo_log_trans()) +
+    scale_fill_brewer("Quarter", palette="Set1") +
+    scale_x_continuous(
+      trans=pseudo_log_trans(),
+      breaks=breaks
+    ) +
     labs(
-      title = sprintf("Histogram - %s", y),
-      x = "Article Counts",
-      y = "Number of Journals"
+      title=sprintf("Histogram - %s", y),
+      x="Article Counts",
+      y="Number of Journals"
     ) +
     theme_minimal() +
     theme(
-      plot.title = element_text(hjust = 0.5),
-      axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 0)),
-      axis.text.x = element_text(angle = 0, hjust = 0.5)
+      plot.title=element_text(hjust=0.5),
+      axis.title.x=element_text(margin=margin(t=10, r=0, b=20, l=0)),
+      axis.title.y=element_text(margin=margin(t=0, r=10, b=0, l=0)),
+      axis.text.x=element_text(angle=0, hjust=0.5)
     )
-  print(p)
+  )
 }
+
+# reset graphical parameters to prior values
+par(default_par, no.readonly=TRUE)
 ```
+\newpage
 
-```{r}
-# # --- more improvements?
-# # a function that computes the histogram for each quarter with the 'FD' bin width and returns a data frame
-# compute_hist_per_quarter <- function(data, year_quarter) {
-#   quarter_data <- data[data$year_quarter == year_quarter, 'count']
-#   hist_data <- hist(quarter_data, breaks = 'FD', plot = FALSE)
-#   
-#   df <- data.frame(year_quarter = year_quarter,
-#                    bin_left = hist_data$breaks[-length(hist_data$breaks)],
-#                    bin_right = hist_data$breaks[-1],
-#                    count_journals = hist_data$counts)
-#   
-#   return(df)
-# }
-# 
-# # create list of histograms
-# unique_year_quarters <- unique(quarterly_df$year_quarter)
-# hist_list <- lapply(unique_year_quarters, function(yq) compute_hist_per_quarter(quarterly_df, yq))
-# quarterly_hist_df <- do.call(rbind, hist_list)
-# 
-# ggplot(data = quarterly_hist_df, aes(xmin = bin_left, xmax = bin_right, ymin = 0, ymax = count_journals)) +
-#   geom_rect(aes(fill = count_journals), color = "black", alpha = 0.75) +
-#   scale_fill_gradient("Number of Journals", low = "white", high = "steelblue") +
-#   labs(title = "Histogram Trends", x = "Article Counts", y = "Year and Quarter") +
-#   scale_y_continuous(breaks = unique(quarterly_hist_df$year_quarter), labels = unique(quarterly_hist_df$year_quarter)) +
-#   theme_minimal() +
-#   theme(plot.title = element_text(hjust = 0.5),
-#         axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 0)),
-#         axis.text.x = element_text(angle = 0, hjust = 0.5))
+# Conclusion
 
-```
+This iteration of the ingestion pipeline is flexible enough to be adapted if user requirements change. Similarly, these early iterations of OLAP queries and corresponding visualizations should be presented as an "alpha" or demo version of a scheduled report. In particular, we need more input from stakeholders about the purpose of the second query, selecting all article counts per journal, year, and quarter. The volume of data involved strongly suggests a very high-level visualization, but in order to produce an appropriate visualization, we need a better sense of the intent or goal behind this query.
 
-
+# Cleanup
+## Close the DB connection
 ```{r closeDbConnection}
 dbDisconnect(olap_dbcon)
 ```
