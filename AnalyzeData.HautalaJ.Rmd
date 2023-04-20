@@ -1,0 +1,602 @@
+---
+title: "Practicum II CS5200"
+date: "Spring 2023"
+author: Jesse Hautala
+output:
+  pdf_document:
+    fig_caption: yes
+    toc: yes
+---
+
+\newpage
+# Prework
+## Prepare Environment for Execution
+### Reinitialize the environment
+```{r clearEnv}
+rm(list=ls())
+```
+
+### Install non-default packages as needed
+```{r installDependencies}
+deps <- c(
+  'knitr',
+  'DBI',
+  'RMariaDB',
+  'stringr',
+  'lubridate',
+  'ggplot2',
+  'qcc',
+  'dplyr',
+  'Hmisc',
+  'tidyr',
+  'pracma',
+  'scales',
+  'gridExtra'
+)
+missingDeps <- setdiff(deps, installed.packages()[,"Package"])
+if (length(missingDeps)) {
+  install.packages(missingDeps)
+}
+
+library(knitr)
+library(DBI)
+library(RMariaDB)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(qcc)
+library(dplyr)
+library(Hmisc)
+library(tidyr)
+library(pracma)
+library(scales)
+library(gridExtra)
+
+# NOTE: We use kable to create nice consistent PDF output.
+# TODO: Figure out how to improve kable output appearance in the notebook.
+options(knitr.table.format='simple')
+options(knitr.kable.NA='')
+```
+
+### Check dependency versions
+NOTE: This notebook was developed using:
+
+* R: 4.2.1
+* knitr: 1.41
+* DBI: 1.1.3
+* RMariaDB: 1.2.2
+* stringr: 1.5.0
+* lubridate: 1.9.2
+* ggplot2: 3.4.2
+* qcc: 2.7
+* dplyr: 1.1.1
+* Hmisc: 5.0.1
+* tidyr: 1.3.0
+* pracma: 2.4.2
+* scales: 1.2.1
+* gridExtra: 2.3
+
+```{r confirmDependencies}
+print(sprintf('R: %s', R.version.string))
+for (dep in deps) {
+  print(sprintf('%s: %s', dep, packageVersion(dep)))
+}
+```
+
+\newpage
+## Establish Constants and Credentials
+IMPORTANT: Initial DB setup requires at least three things:
+
+1. `db_admin_user`: the name of the root user account for your DB server
+2. `db_admin_pass`: the password for your root user
+
+It is simplest to create a YAML credentials file named 'db_cred.yml' alongside the notebook.
+
+NOTE:
+
+* It is not strictly required to use the root account; it just needs read access to the DW.
+* Replace asterisks with your names and passwords.
+* The final line in the file must be empty.
+
+### YAML file structure
+```yaml
+db_admin:
+  name: ************
+  pass: ************
+
+```
+
+If you don't want to create the YAML credentials config file, you can modify
+these 'db_' variables (i.e. `db_user` and `db_pass`).
+
+### Establish user names and passwords
+```{r establishCredentials}
+# load credentials from local secrets file
+db_cred <- yaml::read_yaml('db_cred.yml')
+db_user <- db_cred$db_admin$name
+db_pass <- db_cred$db_admin$pass
+```
+
+### Set DB connection properties
+```{r setDbProps}
+db_host <- 'localhost'
+db_port <- 3306
+```
+
+### Connect to the data warehouse
+```{r connectToOlap}
+olap_dbcon <- dbConnect(
+  RMariaDB::MariaDB(),
+  user=db_user,
+  password=db_pass,
+  host=db_host,
+  port=db_port,
+  load_data_local_infile=TRUE
+)
+```
+
+\newpage
+# Data Pipeline
+## OLTP Ingestion
+For the purposes of this practicum, the OLTP database is intended to be a faithful representation of our upstream data, with just a few assumptions:
+
+* Each article must have a unique 'PMID': All articles have "PMID" in our XML data; none are excluded on this basis.
+* Each journal must have a unique 'ISSN': There are 563 journals missing "ISSN" in our XML data; they are excluded from ingestion. We were also unable to link an additional 563 journals.
+* Each article must be linked to exactly one journal: There are 563 articles linked to journals that are missing "ISSN"; they are excluded during OLTP ingestion.
+* Each article can be linked to zero or more authors: There are no articles missing authors in the data set.
+* Each author is distinct by a combination of `last_name`, `first_name`, `initials`, `suffix`, `collective_name`, and `affiliation`. During OLTP ingestion we drop 16 duplicate authors; it is impossible to distinguish them by any of their attributes or elements, so they are regarded as redundant. NOTE: We also drop 1288 article-author links, due to missing articles (which in turn are due to missing journals, as described above).
+
+## OLAP Ingestion
+During OLAP ingestion the journal and author entities remain largely unchanged, but we make some inferences around publication dates:
+
+* We assume the `season` field is constrained to one of four options: 'Spring', 'Summer', 'Winter', 'Fall'.
+* In order to arrive at a "best guess" for publication date, we assume that the actual publication date is the start of the period indicated. For example, an article record with only `year=1978` and `month=6` in the OLTP DB is imputed to have a publication date of the first of the month (`pub_date='1978-06-01'`). This may cause bias toward publications being attributed to period start dates, but we keep track of the cases where we make these assumptions in dedicated fields on the `dim.pub_date` dimension table.
+* Where we find time ranges in the `medline_date` field, we assume the actual publication date is the start of the period. For example, a `medline_date` value of '1978 Fall-Winter' is imputed to mean `year=1978 ^ month=Fall`. By this method, we find ourselve imputing values for publication year, e.g.: $medline\_date=\text{'1978-1979 Winter'} \implies pub\_year=1978 \land pub\_season=\text{'Winter'}$. Where we made this sort of inference, we set Boolean flags on the `dim.pub_date` table (e.g.: `imputed_year`, `imputed_month`, `imputed_day`, and `imputed_season`) to essentially defer this decision (i.e. query authors can decide whether they want to ignore imputed date fields).
+* When imputing publication date from `season`, we assume the meteorological convention for season start dates:
+  * Spring: March 1
+  * Summer: June 1
+  * Fall: September 1
+  * Winter: December 1
+
+\newpage
+# Analytical Queries
+## Query I: Top Five Journals
+### Get the data
+```{r top5_journals_query}
+# a function for returning the top 5 journals for a given time period
+get_top5_journals <- function(from_date, to_date) {
+  sql <- ("
+    WITH journal_article_count AS(
+      SELECT j.journal_dim_id AS journal_dim_id,
+             j.title AS journal_title,
+             COUNT(DISTINCT aa.article_dim_id) AS article_count
+        FROM fact.article_author as aa,
+             dim.journal as j,
+             dim.pub_date as pd
+       WHERE aa.pub_date_dim_id = pd.pub_date_dim_id
+         AND aa.journal_dim_id = j.journal_dim_id
+         AND pd.pub_date BETWEEN ? AND ?
+    GROUP BY aa.journal_dim_id
+    ORDER BY article_count desc
+  )
+  SELECT journal_dim_id, journal_title, article_count
+    FROM journal_article_count
+   LIMIT 5;"
+  )
+  res <- dbSendQuery(olap_dbcon, sql)
+  dbBind(res, c(from_date, to_date))
+  top5_journals <- dbFetch(res)
+  dbClearResult(res)
+  
+  return(top5_journals)
+}
+
+n_weeks <- 10
+asof_date <- as.Date('1977-09-16') # '77
+from_date <- asof_date - as.difftime(n_weeks, unit='weeks')
+top5_journals <- get_top5_journals(from_date, asof_date)
+kable(top5_journals, caption=sprintf(
+  '\\label{tab:top5}Top 5 Journals for %s weeks as of %s',
+  n_weeks,
+  asof_date
+))
+```
+
+\newpage
+### Plot the results
+```{r top5_journals_pareto, fig.cap="Top 5 Journals Pareto"}
+# prepare titles for wrapping
+top5_journals$title_wrapped <- str_wrap(top5_journals$journal_title, 24)
+
+# convert to factor to control order
+top5_journals$title_wrapped <- factor(
+  top5_journals$title_wrapped,
+  levels=top5_journals$title_wrapped[order(top5_journals$article_count)]
+)
+
+# convert to 32-bit integer
+top5_journals$article_count <- as.integer(top5_journals$article_count)
+
+# create pareto plot
+top5_journals_pareto <- ggplot(top5_journals, aes(x=title_wrapped, y=article_count)) +
+  xlab('Journal Title') +
+  ylab('Articles Published') +
+  labs(fill='Articles\nPublished') +
+  geom_col(aes(fill=article_count), width=0.8) +
+  ggtitle(sprintf('Top 5 Journals for %s weeks as of %s', n_weeks, asof_date)) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust=0.5),
+    axis.title.y = element_text(margin=margin(t=0, r=10, b=0, l=0)),
+    axis.title.x = element_text(margin=margin(t=10, r=0, b=0, l=0)),
+    legend.title = element_text(margin=margin(t=0, r=0, b=10, l=0))
+  )
+top5_journals_pareto
+```
+
+\newpage
+## Query II: Trends per Journal with Time Facet
+### Utility Functions
+```{r yqGrid}
+# a function to generate a table with all years and quarters
+get_yq_grid_df <- function(min_pub_date=NA, max_pub_date=NA) {
+  if (is.na(min_pub_date) || is.na(max_pub_date)) {
+    pub_date_range_df <- dbGetQuery(
+      olap_dbcon,
+      "SELECT min(pub_date) AS min_pub_date,
+              max(pub_date) AS max_pub_date
+         FROM dim.pub_date"
+    )
+    if (is.na(min_pub_date)) {
+      min_pub_date <- pub_date_range_df$min_pub_date
+    }
+    if (is.na(max_pub_date)) {
+      max_pub_date <- pub_date_range_df$max_pub_date
+    }
+  }
+  y_max <- year(max_pub_date)
+  q_max <- quarter(max_pub_date)
+  
+  yq_rows <- list()
+  y <- year(min_pub_date)
+  q <- quarter(min_pub_date)
+  while (y < y_max || y == y_max && q <= q_max) {
+    # add a row
+    yq_rows[[sprintf('%s Q%s', y, q)]] <- list(y=y, q=q)
+    
+    # increment quarter
+    if (q == 4) {
+      y <- y + 1
+      q <- 1
+    } else {
+      q <- q + 1
+    }
+  }
+  yq_df <- do.call(rbind, lapply(yq_rows, as.data.frame))
+  yq_df$year_quarter <- factor(
+    row.names(yq_df),
+    levels=sort(unique(row.names(yq_df))),
+    ordered=TRUE
+  )
+  row.names(yq_df) <- NULL
+  yq_df$count <- as.integer(0)
+  yq_df <- yq_df[, c('y', 'q', 'year_quarter', 'count')]
+  return(yq_df)
+}
+```
+
+\newpage
+### Generate SQL queries for `ROLLUP` aggregation
+```{r rollupSql}
+get_rollup <- function(exclude_month_from_year=FALSE) {
+  sql <- paste0(
+  "
+    WITH quarterly AS(
+      SELECT j.journal_dim_id AS journal_dim_id,
+                  pd.pub_year AS `year`,
+                  pd.pub_quarter `quarter`,
+                  COUNT(DISTINCT aa.article_dim_id) AS `count`
+             FROM dim.pub_date AS pd,
+                  fact.article_author AS aa,
+                  dim.journal AS j
+            WHERE aa.pub_date_dim_id = pd.pub_date_dim_id
+              AND aa.journal_dim_id = j.journal_dim_id",
+  if (exclude_month_from_year) ("
+              AND pd.month_from_year = FALSE") else "",
+  "
+         GROUP BY j.journal_dim_id, `year`, `quarter` WITH ROLLUP
+    )
+    SELECT j.journal_dim_id AS journal_dim_id,
+           j.title AS journal_title,
+           `year`,
+           `quarter`,
+           `count`
+      FROM quarterly AS q,
+           dim.journal AS j
+     WHERE j.journal_dim_id = q.journal_dim_id
+  ORDER BY journal_title, `year`, `quarter`;"
+  )
+  dbGetQuery(olap_dbcon, sql)
+}
+```
+
+\newpage
+### Perform the requested aggregation
+```{r rollupData}
+journal_rollup <- get_rollup()
+requested_aggregation <- journal_rollup[!is.na(journal_rollup$year),]
+top10 <- head(
+  requested_aggregation[order(requested_aggregation$count, decreasing=TRUE),],
+  n=10
+)
+kable(top10,
+  caption='\\label{tab:top10}Top 10 Article Counts per Journal (mixed agg via `ROLLUP`)'
+)
+```
+
+\newpage
+### Prepare the data for visualization
+```{r quarterlyHistograms}
+# extract quarterly counts
+quarterly_df <- journal_rollup[!is.na(journal_rollup$quarter),]
+
+# prepare the data for visualization
+quarterly_df$year_quarter <- paste(quarterly_df$year, quarterly_df$quarter, sep = " Q")
+quarterly_df$year_quarter <- factor(
+  quarterly_df$year_quarter,
+  levels=sort(unique(quarterly_df$year_quarter)),
+  ordered=TRUE
+)
+quarterly_df$count <- as.integer(quarterly_df$count)
+```
+
+### A Boxplot per Quarter
+```{r boxplot, fig.cap="Box Plot per Quarter"}
+qy_df <- get_yq_grid_df()
+quarterly_boxplot <- function(df, notch=FALSE, outlier.alpha=1, desc='Box Plot - Article Counts per Journal') {
+  ggplot(df, aes(x = year_quarter, y = count)) +
+    stat_boxplot(geom='errorbar') +
+    geom_boxplot(
+      notch=notch,
+      outlier.shape=16,
+      outlier.alpha=outlier.alpha
+    ) +
+    labs(
+      title = desc,
+      x = "Year and Quarter",
+      y = "Article Count"
+    ) +
+    scale_x_discrete(
+      breaks=qy_df$year_quarter,
+      labels = function(x) {
+        # TODO: use str_split instead?
+        year_labels <- gsub(" .*", "", x)
+        quarter_labels <- gsub("^[^ ]+ ", "", x)
+        return(ifelse(quarter_labels == "Q1",
+          str_wrap(paste(quarter_labels, year_labels), 4),
+          quarter_labels
+        ))
+      }) +
+    scale_y_continuous(
+      # trans='log2',
+      trans=pseudo_log_trans(),
+      breaks=c(0, 1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100, 200)
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title=element_text(hjust=0.5, margin=margin(t=0, r=0, b=10, l=0)),
+      axis.title.x = element_text(margin=margin(t=10, r=0, b=0, l=0)),
+      axis.title.y = element_text(margin=margin(t=0, r=10, b=0, l=0))
+    )
+}
+quarterly_boxplot(quarterly_df, outlier.alpha=0.25)
+```
+
+This plot shows that the vast majority of journals publish just a few articles per quarter. If the data includes at least two distinct populations, we can use k-means to separate out more coherent populations.
+
+```{r topCluster, fig.cap="Box Plot for High Volume Journals"}
+journal_stats <- quarterly_df %>%
+  group_by(journal_title) %>%
+  dplyr::summarize(total_count = sum(count))
+
+# k-means clustering
+set.seed(42)
+clusters <- kmeans(journal_stats$total_count, centers=2)
+journal_stats$cluster <- factor(clusters$cluster)
+clustered_df <- merge(quarterly_df, journal_stats %>% select(journal_title, cluster), by = "journal_title")
+
+# split per cluster
+quarterly_df_split <- split(clustered_df, clustered_df$cluster)
+
+# plot the highest cluster
+high_volume_journals_df <- quarterly_df_split[[which.max(clusters$centers)]]
+quarterly_boxplot(
+  high_volume_journals_df,
+  desc=sprintf('Top %s High Volume Journals', nrow(high_volume_journals_df)),
+  # notch=TRUE,
+  outlier.alpha=0.25
+)
+```
+
+
+```{r}
+# yq_grid_df <- get_yq_grid_df()
+# n_journals <- length(unique(quarterly_df$journal_title))
+# 
+# kdes <- list()
+# for (yq in quarterly_df$year_quarter) {
+#   # only using non-zero counts
+#   # counts <- quarterly_df[quarterly_df$year_quarter == yq, 'count']
+#   # if (length(counts) == 0) {
+#   #   counts <- c(0, 0)
+#   # } else if (length(counts) == 1) {
+#   #   counts <- c(counts[[1]], counts[[1]])
+#   # }
+#   # kdes[[yq]] <- density(counts)
+#   
+#   # NOTE: including all zeroes makes the lowest values way too strong
+#   counts <- quarterly_df[quarterly_df$year_quarter == yq, 'count']
+#   zeroes <- rep(0, n_journals - length(counts))
+#   kdes[[yq]] <- density(c(counts, zeroes))
+# }
+# 
+# kde_data <- lapply(names(kdes), function(yq) {
+#   kde <- kdes[[yq]]
+#   data.frame(x = yq, y = kde$x, strength = kde$y)
+# }) %>%
+#   bind_rows()
+# 
+# # scale the 'strength'
+# strength_scale <- function(x, p = .2, to = c(0, 1), from = range(x, na.rm = TRUE)) {
+#   # (log1p(x) - log1p(from[1])) / (log1p(from[2]) - log1p(from[1])) * (to[2] - to[1]) + to[1]
+#   (log1p(x^p) - log1p(from[1]^p)) / (log1p(from[2]^p) - log1p(from[1]^p)) * (to[2] - to[1]) + to[1]
+#   # log1p(x^p) / (log1p(from[2]^p) - log1p(from[1]^p)) * (to[2] - to[1]) + to[1]
+# }
+# ggplot(kde_data, aes(x = x, y = y, fill = strength)) +
+#   geom_tile(aes(height = 0.9, width = 0.9)) +
+#   scale_fill_gradient('Number of Journals', low='white', high='steelblue', rescaler=strength_scale) +
+#   scale_x_discrete(labels = function(x) {
+#     # TODO: use str_split instead?
+#     year_labels <- gsub(" .*", "", x)
+#     quarter_labels <- gsub("^[^ ]+ ", "", x)
+#     return(ifelse(
+#       quarter_labels == "Q1",
+#       str_wrap(paste(quarter_labels, year_labels), 4),
+#       quarter_labels
+#     ))
+#   }) +
+#   theme_minimal() +
+#   theme(axis.text.y = element_text(angle = 0)) +
+#   labs(x = "Year and Quarter", y = "Article Counts")
+```
+
+
+```{r}
+# NOTE: this is neat but x axis all messed up; also uniform bin count per quarter
+# NOTE: also, it is currently broken...
+# ggplot(data = quarterly_hist_complete_df, aes(x = reorder(year_quarter, year_quarter), y = bin, fill = count_journals)) +
+#   geom_bar(width = 0.9, height = 0.9) +
+#   scale_fill_gradient("Number of Journals", low = "white", high = "steelblue") +
+#   labs(
+#     title = sprintf("Histogram - %s", y),
+#     x = "Year and Quarter",
+#     y = "Article Counts"
+#   ) +
+#   scale_x_discrete(labels = function(x) {
+#     year_labels <- gsub(" .*", "", x)
+#     quarter_labels <- gsub("^[^ ]+ ", "", x)
+#     return(ifelse(
+#       quarter_labels == "Q1",
+#       str_wrap(paste(quarter_labels, year_labels), 4),
+#       quarter_labels
+#     ))
+#   }) +
+#   theme_minimal() +
+#   theme(
+#     plot.title = element_text(hjust = 0.5),
+#     axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 0)),
+#     axis.text.x = element_text(angle = 0, hjust = 0.5)
+#   )
+```
+
+
+```{r}
+# create a placeholder data frame for missing year_quarter and bin combinations
+yq_grid_df <- get_yq_grid_df()
+
+plot_list <- list()
+all_journals <- unique(quarterly_df$journal_title)
+par(mfrow = c(length(unique(yq_grid_df$y)), 1))
+for (y in sort(unique(yq_grid_df$y))) {
+  # Create a data frame to store histogram data
+  hist_data <- data.frame()
+  max_count <- max(quarterly_df[quarterly_df$year == y, 'count'])
+  breaks <- c(0, 1, logspace(log10(2), log10(max_count), 11))
+  for (q in sort(unique(yq_grid_df$q[yq_grid_df$y == y]))) {
+    subset_df <- quarterly_df[(quarterly_df$year == y & quarterly_df$quarter==q), c('quarter', 'count')]
+    # num_zeroes <- length(all_journals) - nrow(subset_df)
+    # with_zeroes <- c(subset_df$count, zeroes)
+    hname <- sprintf('Q%s', q)
+    hd <- hist(
+      # with_zeroes,
+      # breaks="Sturges",
+      breaks=breaks,
+      subset_df$count,
+      # breaks=20,
+      plot=FALSE
+    )
+
+    tmp_df <- data.frame(
+      year_quarter = rep(hname, length(hd$mids)),
+      left = hd$breaks[-length(hd$breaks)],
+      right = hd$breaks[2:length(hd$breaks)],
+      mids = hd$mids,
+      counts = hd$counts
+    )
+    hist_data <- rbind(hist_data, tmp_df)
+  }
+
+  hist_data_cum <- hist_data %>%
+    group_by(mids) %>%
+    mutate(
+      bottom = cumsum(counts) - counts,
+      top = cumsum(counts)
+    ) %>%
+    ungroup()
+  p <- ggplot(hist_data_cum, aes(xmin = left, xmax = right, ymin = bottom, ymax = bottom + counts, fill = year_quarter)) +
+    geom_rect() +
+    scale_fill_brewer("Quarter", palette = "Set1") +
+    scale_x_continuous(trans=pseudo_log_trans()) +
+    labs(
+      title = sprintf("Histogram - %s", y),
+      x = "Article Counts",
+      y = "Number of Journals"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 0)),
+      axis.text.x = element_text(angle = 0, hjust = 0.5)
+    )
+  print(p)
+}
+```
+
+```{r}
+# # --- more improvements?
+# # a function that computes the histogram for each quarter with the 'FD' bin width and returns a data frame
+# compute_hist_per_quarter <- function(data, year_quarter) {
+#   quarter_data <- data[data$year_quarter == year_quarter, 'count']
+#   hist_data <- hist(quarter_data, breaks = 'FD', plot = FALSE)
+#   
+#   df <- data.frame(year_quarter = year_quarter,
+#                    bin_left = hist_data$breaks[-length(hist_data$breaks)],
+#                    bin_right = hist_data$breaks[-1],
+#                    count_journals = hist_data$counts)
+#   
+#   return(df)
+# }
+# 
+# # create list of histograms
+# unique_year_quarters <- unique(quarterly_df$year_quarter)
+# hist_list <- lapply(unique_year_quarters, function(yq) compute_hist_per_quarter(quarterly_df, yq))
+# quarterly_hist_df <- do.call(rbind, hist_list)
+# 
+# ggplot(data = quarterly_hist_df, aes(xmin = bin_left, xmax = bin_right, ymin = 0, ymax = count_journals)) +
+#   geom_rect(aes(fill = count_journals), color = "black", alpha = 0.75) +
+#   scale_fill_gradient("Number of Journals", low = "white", high = "steelblue") +
+#   labs(title = "Histogram Trends", x = "Article Counts", y = "Year and Quarter") +
+#   scale_y_continuous(breaks = unique(quarterly_hist_df$year_quarter), labels = unique(quarterly_hist_df$year_quarter)) +
+#   theme_minimal() +
+#   theme(plot.title = element_text(hjust = 0.5),
+#         axis.title.x = element_text(margin = margin(t = 20, r = 0, b = 0, l = 0)),
+#         axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+```
+
+
+```{r closeDbConnection}
+dbDisconnect(olap_dbcon)
+```
+
