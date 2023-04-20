@@ -299,38 +299,148 @@ get_yq_grid_df <- function(min_pub_date=NA, max_pub_date=NA) {
 ```{r rollupSql}
 get_rollup <- function(
     exclude_month_from_year=FALSE,
-    exclude_month_from_season=FALSE
+    exclude_month_from_season=FALSE,
+    commensurate_rollup=FALSE
 ) {
-  sql <- paste0(
-  "
-    WITH quarterly AS(
-      SELECT j.journal_dim_id AS journal_dim_id,
-                  pd.pub_year AS `year`,
-                  pd.pub_quarter `quarter`,
-                  COUNT(DISTINCT aa.article_dim_id) AS `count`
-             FROM dim.pub_date AS pd,
-                  fact.article_author AS aa,
-                  dim.journal AS j
-            WHERE aa.pub_date_dim_id = pd.pub_date_dim_id
-              AND aa.journal_dim_id = j.journal_dim_id",
-  if (exclude_month_from_year) ("
-              AND pd.month_from_year = FALSE") else "",
-  if (exclude_month_from_season) ("
-              AND pd.month_from_season = FALSE") else "",
-  "
-         GROUP BY j.journal_dim_id, `year`, `quarter` WITH ROLLUP
-    )
-    SELECT j.journal_dim_id AS journal_dim_id,
-           j.title AS journal_title,
-           `year`,
-           `quarter`,
-           `count`
-      FROM quarterly AS q,
-           dim.journal AS j
-     WHERE j.journal_dim_id = q.journal_dim_id
-  ORDER BY journal_title, `year`, `quarter`;"
-  )
-  dbGetQuery(olap_dbcon, sql)
+  if (exclude_month_from_year || exclude_month_from_season) {
+    if (commensurate_rollup) {
+      # NOTE: This solution entirely excludes journals where the month was imputed
+      #       as January by `pub_year` or season start by `pub_season`.
+      return(dbGetQuery(
+        olap_dbcon,
+        paste0("
+            WITH quarterly AS(
+              SELECT j.journal_dim_id AS journal_dim_id,
+                          pd.pub_year AS `year`,
+                          pd.pub_quarter `quarter`,
+                          COUNT(DISTINCT aa.article_dim_id) AS `count`
+                     FROM dim.pub_date AS pd,
+                          fact.article_author AS aa,
+                          dim.journal AS j
+                    WHERE aa.pub_date_dim_id = pd.pub_date_dim_id
+                      AND aa.journal_dim_id = j.journal_dim_id",
+          if (exclude_month_from_year) ("
+                      AND pd.month_from_year = FALSE") else "",
+          if (exclude_month_from_season) ("
+                      AND pd.month_from_season = FALSE") else "",
+          "
+                 GROUP BY j.journal_dim_id, `year`, `quarter` WITH ROLLUP
+            )
+            SELECT j.journal_dim_id AS journal_dim_id,
+                   j.title AS journal_title,
+                   `year`,
+                   `quarter`,
+                   `count`
+              FROM quarterly AS q,
+                   dim.journal AS j
+             WHERE j.journal_dim_id = q.journal_dim_id
+          ORDER BY journal_title, `year`, `quarter`;
+        ")
+      ))
+    } else {
+      # NOTE: We may not want to apply the exact same restrictions during rollup.
+      #       That is, even if we don't want to impute month from year and
+      #       count them towards Q1, we can still include them in yearly counts.
+      #       This illustrates the complexity of those "imputed date" flags;
+      #       ultimately, we should finalize requirements with stakeholders
+      #       and simplify this logic as much as possible.
+      per_quarter <- dbGetQuery(
+        olap_dbcon,
+        paste0("
+            WITH quarterly AS(
+              SELECT j.journal_dim_id AS journal_dim_id,
+                          pd.pub_year AS `year`,
+                          pd.pub_quarter `quarter`,
+                          COUNT(DISTINCT aa.article_dim_id) AS `count`
+                     FROM dim.pub_date AS pd,
+                          fact.article_author AS aa,
+                          dim.journal AS j
+                    WHERE aa.pub_date_dim_id = pd.pub_date_dim_id
+                      AND aa.journal_dim_id = j.journal_dim_id",
+          if (exclude_month_from_year) ("
+                      AND pd.month_from_year = FALSE") else "",
+          if (exclude_month_from_season) ("
+                      AND pd.month_from_season = FALSE") else "",
+          "
+                 GROUP BY j.journal_dim_id, `year`, `quarter`
+            )
+            SELECT j.journal_dim_id AS journal_dim_id,
+                   j.title AS journal_title,
+                   `year`,
+                   `quarter`,
+                   `count`
+              FROM quarterly AS q,
+                   dim.journal AS j
+             WHERE j.journal_dim_id = q.journal_dim_id;
+        ")
+      )
+      per_quarter$year <- as.integer(per_quarter$year)
+      per_quarter$quarter <- as.integer(per_quarter$quarter)
+      per_quarter$count <- as.integer(per_quarter$count)
+      
+      # NOTE: We need a separate query with different
+      #       `pub_date` filter to get year counts.
+      per_year <- dbGetQuery(
+        olap_dbcon,
+        ("
+          WITH quarterly AS(
+            SELECT j.journal_dim_id AS journal_dim_id,
+                        pd.pub_year AS `year`,
+                        COUNT(DISTINCT aa.article_dim_id) AS `count`
+                   FROM dim.pub_date AS pd,
+                        fact.article_author AS aa,
+                        dim.journal AS j
+                  WHERE aa.pub_date_dim_id = pd.pub_date_dim_id
+                    AND aa.journal_dim_id = j.journal_dim_id
+               GROUP BY j.journal_dim_id, `year` WITH ROLLUP
+          )
+          SELECT j.journal_dim_id AS journal_dim_id,
+                 j.title AS journal_title,
+                 `year`,
+                 `count`
+            FROM quarterly AS q,
+                 dim.journal AS j
+           WHERE j.journal_dim_id = q.journal_dim_id;
+        ")
+      )
+      per_year$year <- as.integer(per_year$year)
+      per_year$quarter <- NA_integer_
+      per_year$count <- as.integer(per_year$count)
+      
+      # NOTE: We manually perform the `ROLLUP` aggregation, emulating the SQL
+      #       `ROLLUP` function. This solution differs from SQL `ROLLUP` in that
+      #       we may be able to include an ambiguous publication date in yearly
+      #       totals that was excluded from quarterly totals.
+      rollup_df <- rbind(per_quarter, per_year)
+      rollup_df <- rollup_df[with(rollup_df, order(year, quarter)), ]
+      return(rollup_df)
+    }
+  } else {
+    sql <- ("
+        WITH quarterly AS(
+          SELECT j.journal_dim_id AS journal_dim_id,
+                      pd.pub_year AS `year`,
+                      pd.pub_quarter `quarter`,
+                      COUNT(DISTINCT aa.article_dim_id) AS `count`
+                 FROM dim.pub_date AS pd,
+                      fact.article_author AS aa,
+                      dim.journal AS j
+                WHERE aa.pub_date_dim_id = pd.pub_date_dim_id
+                  AND aa.journal_dim_id = j.journal_dim_id
+             GROUP BY j.journal_dim_id, `year`, `quarter` WITH ROLLUP
+        )
+        SELECT j.journal_dim_id AS journal_dim_id,
+               j.title AS journal_title,
+               `year`,
+               `quarter`,
+               `count`
+          FROM quarterly AS q,
+               dim.journal AS j
+         WHERE j.journal_dim_id = q.journal_dim_id
+      ORDER BY journal_title, `year`, `quarter`;
+    ")
+    return(dbGetQuery(olap_dbcon, sql))
+  }
 }
 ```
 
@@ -377,11 +487,15 @@ kable(
   single_journal_df[with(single_journal_df, order(year, quarter)),],
   row.names=FALSE,
   caption=sprintf(
-    '\\label{tab:clipped_month}Article Counts with/without clipped month (journal_dim_id=%s)',
+    '\\label{tab:clipped_month}Quarterly Counts with/without clipped month (journal %s)',
     incl_clipped[1,'journal_dim_id']
   )
 )
 ```
+
+The results in Table \ref{tab:clipped_month} show that by inferring `pub_month` from `pub_year` we assign an additional `196` articles to `1976 Q1`. Without this inference, `1977 Q1` is entirely excluded. This may or may not be what the stakeholders want, but our schema affords us the flexibility to adapt to different requirements. For the remainder of this report we assume such inference is appropriate.
+
+NOTE: We should meet with stakeholders to discuss the requirements to see if we can simplify our solution. Ideally, we can finalize reporting requirements such that the `dim.pub_date` columns for tracking imputed date information are no longer needed; it would be simpler to enforce more assumptions during OLAP ingestion.
 
 \newpage
 ### Prepare the data for visualization
@@ -497,8 +611,10 @@ for (yq in yq_grid_df$year_quarter) {
   kdes[[yq]] <- density(
     counts,
     bw=0.05,
-    # kernel="rectangular"
-    kernel="epanechnikov"
+    # bw=0.33,
+    # bw=0.5,
+    kernel="rectangular"
+    # kernel="epanechnikov"
   )
 
   # NOTE: this solution excludes 
@@ -514,7 +630,7 @@ kde_data <- lapply(names(kdes), function(yq) {
   bind_rows()
 
 # scale the 'strength' (i.e. estimated journal density per KDE)
-strength_scale <- function(x, p=0.3, to=c(0, 1), from=range(x, na.rm=TRUE)) {
+strength_scale <- function(x, p=0.4, to=c(0, 1), from=range(x, na.rm=TRUE)) {
   to_range <- to[2] - to[1]
   offset <- log1p(x^p) - log1p(from[1]^p)
   from_range <- log1p(from[2]^p) - log1p(from[1]^p)
@@ -535,7 +651,7 @@ suppressWarnings(
     ggplot(kde_data, aes(x=x, y=y, fill=strength)) +
       geom_tile(aes(height=0.9, width=0.75)) +
       scale_fill_gradient(
-        'Journal\nCount',
+        'KDE\nEstimated\nJournal\nCount',
         low='white',
         high='steelblue',
         rescaler=strength_scale
@@ -555,9 +671,17 @@ suppressWarnings(
         breaks=c(0, 1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 100, 200),
         limits=c(0, max(df$count))
       ) +
+      labs(
+        title="Kernel Density Estimate Trend Plot",
+        x="Year and Quarter",
+        y="Article Counts"
+      ) +
       theme_minimal() +
-      theme(axis.text.y=element_text(angle=0)) +
-      labs(x="Year and Quarter", y="Article Counts")
+      theme(
+        plot.title=element_text(hjust=0.5, margin=margin(t=0, r=0, b=10, l=0)),
+        axis.title.x=element_text(margin=margin(t=10, r=0, b=0, l=0)),
+        axis.title.y=element_text(margin=margin(t=0, r=10, b=0, l=0))
+      )
   )
 )
 ```
